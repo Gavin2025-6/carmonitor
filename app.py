@@ -276,13 +276,15 @@ def iso_to_relative_posted_time(iso_value: str) -> str:
 
 
 def is_kijiji_posted_within_10_minutes(posted_text: str) -> bool:
-    """Only '< 1 minute ago' or 'X minutes ago' with X<=10 (Kijiji-style). All else skip."""
+    """Posted within 10m: '< 1 min ago' variants, or 'X min(s)/minute(s) ago' with X<=10."""
     if not posted_text or posted_text == "N/A":
         return False
     text = posted_text.strip().lower()
-    if re.search(r"<\s*1\s*minute\s*ago", text):
+    # Under one minute: < 1 min / minute / mins / minutes ago
+    if re.search(r"<\s*1\s*(?:minutes?|mins?)\s*ago", text):
         return True
-    minute_match = re.search(r"(\d+)\s*minutes?\s*ago", text)
+    # X min ago, X mins ago, X minute ago, X minutes ago (longer alternates first)
+    minute_match = re.search(r"(\d+)\s*(?:minutes?|mins?)\s*ago", text)
     if minute_match:
         return int(minute_match.group(1)) <= 10
     return False
@@ -495,6 +497,12 @@ def scrape_kijiji() -> list[dict]:
             continue
         seen.add(data["listing_id"])
         listings.append(data)
+    for index, item in enumerate(listings[:3]):
+        print(
+            "[scrape debug] "
+            f"#{index + 1} listing_id={item.get('listing_id')!r} "
+            f"posted_time_raw={item.get('posted_time')!r}"
+        )
     return listings
 
 
