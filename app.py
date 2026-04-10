@@ -13,7 +13,7 @@ from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask, render_template_string
 
 load_dotenv()
 
@@ -644,18 +644,112 @@ def monitor_loop() -> None:
 @app.get("/")
 def health() -> tuple:
     with state_lock:
-        return (
-            jsonify(
-                {
-                    "status": "running" if monitor_state["running"] else "starting",
-                    "last_scrape": monitor_state["last_scrape"],
-                    "last_error": monitor_state["last_error"],
-                    "new_today": monitor_state["new_today"],
-                    "interval_seconds": SCRAPE_INTERVAL_SECONDS,
-                }
-            ),
-            200,
-        )
+        running = monitor_state["running"]
+        last_scrape = monitor_state["last_scrape"] or "Never"
+        last_error = monitor_state["last_error"] or "None"
+        new_today = monitor_state["new_today"]
+
+    html = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Kijiji Monitor Dashboard</title>
+        <style>
+          :root {
+            --bg: #0b1220;
+            --panel: #121a2b;
+            --text: #e5e7eb;
+            --muted: #9ca3af;
+            --ok: #22c55e;
+            --err: #ef4444;
+            --border: #1f2937;
+          }
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: radial-gradient(circle at top, #111827 0%, var(--bg) 60%);
+            color: var(--text);
+            padding: 28px;
+          }
+          .container {
+            max-width: 980px;
+            margin: 0 auto;
+          }
+          .title {
+            font-size: 30px;
+            font-weight: 700;
+            margin: 0 0 20px 0;
+          }
+          .subtitle {
+            color: var(--muted);
+            margin: 0 0 28px 0;
+          }
+          .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+          }
+          .card {
+            background: linear-gradient(180deg, #172033 0%, var(--panel) 100%);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 18px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+          }
+          .label {
+            color: var(--muted);
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+          }
+          .value {
+            margin-top: 10px;
+            font-size: 24px;
+            font-weight: 700;
+            line-height: 1.2;
+            word-break: break-word;
+          }
+          .ok { color: var(--ok); }
+          .err { color: var(--err); }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1 class="title">Railway Dashboard</h1>
+          <p class="subtitle">Kijiji GTA Car Monitor Runtime Status</p>
+          <div class="grid">
+            <div class="card">
+              <div class="label">系统状态</div>
+              <div class="value {{ 'ok' if running else 'err' }}">{{ 'Running' if running else 'Stopped' }}</div>
+            </div>
+            <div class="card">
+              <div class="label">最后抓取时间</div>
+              <div class="value">{{ last_scrape }}</div>
+            </div>
+            <div class="card">
+              <div class="label">今日新车数量</div>
+              <div class="value ok">{{ new_today }}</div>
+            </div>
+            <div class="card">
+              <div class="label">最后错误信息</div>
+              <div class="value {{ 'err' if last_error != 'None' else 'ok' }}">{{ last_error }}</div>
+            </div>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    return render_template_string(
+        html,
+        running=running,
+        last_scrape=last_scrape,
+        new_today=new_today,
+        last_error=last_error,
+    )
 
 
 def main() -> None:
