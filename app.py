@@ -1,58 +1,31 @@
 import os
-import re
-import json
-import time
-import random
-import sqlite3
-import threading
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
-
-import os
-import json
 import random
 import re
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, render_template_string
+from flask import Flask, jsonify
 
 load_dotenv()
 
 KIJIJI_URL = "https://www.kijiji.ca/b-cars-trucks/toronto/c174l1700273"
-DB_PATH = "kijiji_monitor.db"
-MARKET_REFERENCE_PATH = "market_reference.json"
-SLEEP_MIN_SECONDS = 280
-SLEEP_MAX_SECONDS = 320
-BLOCK_KEYWORDS = ("WANTED", "REBUILT", "ACCIDENT", "PARTS")
-DEALER_KEYWORDS = (
-    "dealer",
-    "dealership",
-    "financing available",
-    "omvic",
-    "trade-in",
-    "car lot",
-    "sales representative",
-)
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-]
+DB_PATH = "kijiji_seen.db"
+SCRAPE_INTERVAL_SECONDS = 300  # 5 minutes
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
 
 app = Flask(__name__)
 
@@ -60,22 +33,10 @@ monitor_state = {
     "running": False,
     "last_scrape": None,
     "last_error": None,
+    "new_today": 0,
+    "today_date": datetime.now().strftime("%Y-%m-%d"),
 }
 state_lock = threading.Lock()
-MARKET_REFERENCE: dict[str, int] = {}
-
-
-@dataclass
-class Listing:
-    listing_id: str
-    title: str
-    price: int
-    mileage: Optional[int]
-    year: Optional[int]
-    seller_type: str
-    link: str
-    image_url: Optional[str]
-    key: str
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -86,40 +47,19 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
+    conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS listings (
+        CREATE TABLE IF NOT EXISTS seen_listings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             listing_id TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            mileage INTEGER,
-            year INTEGER,
-            seller_type TEXT NOT NULL,
+            title TEXT,
             link TEXT NOT NULL,
-            image_url TEXT,
-            key TEXT,
-            is_hot_deal INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
+            first_seen_at TEXT NOT NULL
         )
         """
     )
     conn.commit()
     conn.close()
-
-
-def load_market_reference() -> dict[str, int]:
-    try:
-        with open(MARKET_REFERENCE_PATH, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        normalized = {}
-        for key, value in data.items():
-            if isinstance(key, str) and isinstance(value, (int, float)):
-                normalized[key.lower().strip()] = int(value)
-        return normalized
-    except Exception:
-        return {}
 
 
 def parse_price(text: str) -> Optional[int]:
@@ -129,8 +69,8 @@ def parse_price(text: str) -> Optional[int]:
     return int(digits)
 
 
-def parse_year(title: str) -> Optional[int]:
-    match = re.search(r"\b(19\d{2}|20\d{2})\b", title)
+def parse_year(text: str) -> Optional[int]:
+    match = re.search(r"\b(19\d{2}|20\d{2})\b", text or "")
     if not match:
         return None
     year = int(match.group(1))
@@ -142,104 +82,68 @@ def parse_year(title: str) -> Optional[int]:
 def parse_mileage(text: str) -> Optional[int]:
     if not text:
         return None
-    lower = text.lower()
-    if "km" not in lower:
+    if "km" not in text.lower():
         return None
-    digits = re.sub(r"[^\d]", "", lower)
+    match = re.search(r"([\d,\. ]{3,})\s*km", text.lower())
+    if not match:
+        return None
+    digits = re.sub(r"[^\d]", "", match.group(1))
     if not digits:
         return None
     value = int(digits)
-    return value if value < 1_500_000 else None
+    if value <= 0 or value > 2_000_000:
+        return None
+    return value
 
 
-def is_blocked_listing(text: str) -> bool:
-    upper_text = text.upper()
-    return any(keyword in upper_text for keyword in BLOCK_KEYWORDS)
-
-
-def normalize_model_key(title: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9 ]", " ", title.lower())
-    tokens = [t for t in cleaned.split() if t]
-    tokens = [t for t in tokens if t not in {"automatic", "manual", "awd", "fwd", "rwd", "4wd"}]
-    return " ".join(tokens[:3]) if tokens else "unknown-model"
-
-
-def classify_seller(description: str) -> str:
-    haystack = (description or "").lower()
-    if any(keyword in haystack for keyword in DEALER_KEYWORDS):
-        return "DEALER"
-    if "private seller" in haystack or "private" in haystack:
-        return "PRIVATE"
-    return "PRIVATE"
-
-
-def market_price_for_title(title: str) -> Optional[int]:
-    lowered_title = title.lower()
-    for model_name, market_price in MARKET_REFERENCE.items():
-        if model_name in lowered_title:
-            return market_price
-    return None
-
-
-def extract_listing(card) -> Optional[Listing]:
+def extract_listing(card) -> Optional[dict]:
     listing_id = card.get("data-listing-id") or card.get("data-vip-url")
     title_el = card.select_one('[data-testid="listing-title"], .title, a.title')
     price_el = card.select_one('[data-testid="listing-price"], .price, .price-wrapper')
     link_el = card.select_one('a[data-testid="listing-link"], a.title, a')
     image_el = card.select_one("img")
+    desc_el = card.select_one('[data-testid="listing-description"], .description')
 
-    if not title_el or not price_el or not link_el:
+    if not title_el or not link_el:
         return None
 
     title = title_el.get_text(" ", strip=True)
-    if not title:
+    href = link_el.get("href", "").strip()
+    if not title or not href:
         return None
 
-    price = parse_price(price_el.get_text(" ", strip=True))
-    if price is None:
-        return None
-
-    href = link_el.get("href", "")
     if href.startswith("/"):
         link = f"https://www.kijiji.ca{href}"
     else:
         link = href
-    if not link:
-        return None
 
     if not listing_id:
         listing_id = link
 
-    desc_el = card.select_one('[data-testid="listing-description"], .description')
-    details_text = card.get_text(" ", strip=True)
-    if desc_el:
-        details_text += " " + desc_el.get_text(" ", strip=True)
+    full_text = card.get_text(" ", strip=True)
+    description = desc_el.get_text(" ", strip=True) if desc_el else full_text
 
-    if is_blocked_listing(f"{title} {details_text}"):
-        return None
-
-    mileage = parse_mileage(details_text)
+    price = parse_price(price_el.get_text(" ", strip=True)) if price_el else None
     year = parse_year(title)
-    seller_type = classify_seller(details_text)
+    mileage = parse_mileage(full_text)
+
     image_url = image_el.get("src") if image_el else None
     if image_url and image_url.startswith("//"):
         image_url = f"https:{image_url}"
 
-    key = f"{year or 'unknown-year'}-{normalize_model_key(title)}"
-    return Listing(
-        listing_id=str(listing_id),
-        title=title,
-        price=price,
-        mileage=mileage,
-        year=year,
-        seller_type=seller_type,
-        link=link,
-        image_url=image_url,
-        key=key,
-    )
+    return {
+        "listing_id": str(listing_id),
+        "title": title,
+        "price": price,
+        "year": year,
+        "mileage": mileage,
+        "description": description,
+        "link": link,
+        "image_url": image_url,
+    }
 
 
-def scrape_listings() -> list[Listing]:
+def scrape_kijiji() -> list[dict]:
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     response = requests.get(KIJIJI_URL, headers=headers, timeout=30)
     response.raise_for_status()
@@ -249,73 +153,71 @@ def scrape_listings() -> list[Listing]:
         '[data-testid="listing-card"], [data-listing-id], .search-item, .regular-ad'
     )
 
-    listings: list[Listing] = []
-    seen_ids = set()
+    listings = []
+    seen = set()
     for card in cards:
-        listing = extract_listing(card)
-        if listing and listing.listing_id not in seen_ids:
-            seen_ids.add(listing.listing_id)
-            listings.append(listing)
+        data = extract_listing(card)
+        if not data:
+            continue
+        if data["listing_id"] in seen:
+            continue
+        seen.add(data["listing_id"])
+        listings.append(data)
     return listings
 
 
-def is_seen_listing(conn: sqlite3.Connection, listing_id: str) -> bool:
+def is_seen(conn: sqlite3.Connection, listing_id: str) -> bool:
     row = conn.execute(
-        "SELECT 1 FROM listings WHERE listing_id = ? LIMIT 1", (listing_id,)
+        "SELECT 1 FROM seen_listings WHERE listing_id = ? LIMIT 1", (listing_id,)
     ).fetchone()
     return row is not None
 
 
-def store_listing(conn: sqlite3.Connection, listing: Listing, is_hot_deal: bool) -> None:
+def save_seen(conn: sqlite3.Connection, listing: dict) -> None:
     conn.execute(
         """
-        INSERT INTO listings (
-            listing_id, title, price, mileage, year, seller_type, link, image_url, key, is_hot_deal, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO seen_listings (listing_id, title, link, first_seen_at)
+        VALUES (?, ?, ?, ?)
         """,
         (
-            listing.listing_id,
-            listing.title,
-            listing.price,
-            listing.mileage,
-            listing.year,
-            listing.seller_type,
-            listing.link,
-            listing.image_url,
-            listing.key,
-            1 if is_hot_deal else 0,
+            listing["listing_id"],
+            listing["title"],
+            listing["link"],
             datetime.utcnow().isoformat(timespec="seconds"),
         ),
     )
 
 
-def format_alert(listing: Listing, is_hot_deal: bool, market_price: Optional[float]) -> str:
-    deal_tag = "🔥 HOT DEAL\n" if is_hot_deal else ""
-    market_line = f"\nMarket ref: ${int(market_price):,}" if market_price else ""
-    mileage_text = f"{listing.mileage:,} km" if listing.mileage is not None else "N/A"
-    year_text = str(listing.year) if listing.year else "N/A"
+def build_message(listing: dict) -> str:
+    price_text = f"${listing['price']:,}" if listing.get("price") else "N/A"
+    mileage_text = (
+        f"{listing['mileage']:,} km" if listing.get("mileage") is not None else "N/A"
+    )
+    year_text = str(listing["year"]) if listing.get("year") else "N/A"
     return (
-        f"{deal_tag}[{listing.seller_type}]\n"
-        f"{listing.title}\n"
-        f"Price: ${listing.price:,}{market_line}\n"
-        f"Year: {year_text}\n"
+        "🚗 New Kijiji Listing\n"
+        f"Title: {listing['title']}\n"
+        f"Price: {price_text}\n"
         f"Mileage: {mileage_text}\n"
-        f"Link: {listing.link}"
+        f"Year: {year_text}\n"
+        f"Link: {listing['link']}"
     )
 
 
-def send_telegram_alert(listing: Listing, is_hot_deal: bool, market_price: Optional[float]) -> None:
+def send_telegram(listing: dict) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    text = format_alert(listing, is_hot_deal, market_price)
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    if listing.image_url:
+    text = build_message(listing)
+    image_url = listing.get("image_url")
+
+    if image_url:
         requests.post(
             f"{base_url}/sendPhoto",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "photo": listing.image_url,
+                "photo": image_url,
                 "caption": text[:1000],
             },
             timeout=20,
@@ -328,28 +230,21 @@ def send_telegram_alert(listing: Listing, is_hot_deal: bool, market_price: Optio
         )
 
 
-def process_scrape_cycle() -> int:
-    scraped = scrape_listings()
+def scrape_and_notify() -> int:
+    listings = scrape_kijiji()
     conn = get_db_connection()
-    new_listings: list[tuple[Listing, bool, Optional[float]]] = []
-
-    for listing in scraped:
-        if is_seen_listing(conn, listing.listing_id):
-            continue
-        market_price = market_price_for_title(listing.title)
-        is_hot_deal = market_price is not None and listing.price < market_price * 0.9
-        store_listing(conn, listing, is_hot_deal)
-        new_listings.append((listing, is_hot_deal, market_price))
-
-    conn.commit()
-    conn.close()
-
-    # Private sellers are prioritized in notifications.
-    new_listings.sort(key=lambda item: 0 if item[0].seller_type == "PRIVATE" else 1)
-    for listing, is_hot_deal, market_price in new_listings:
-        send_telegram_alert(listing, is_hot_deal, market_price)
-
-    return len(new_listings)
+    new_count = 0
+    try:
+        for listing in listings:
+            if is_seen(conn, listing["listing_id"]):
+                continue
+            save_seen(conn, listing)
+            send_telegram(listing)
+            new_count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return new_count
 
 
 def monitor_loop() -> None:
@@ -358,97 +253,47 @@ def monitor_loop() -> None:
 
     while True:
         try:
-            new_count = process_scrape_cycle()
+            now_date = datetime.now().strftime("%Y-%m-%d")
+            with state_lock:
+                if monitor_state["today_date"] != now_date:
+                    monitor_state["today_date"] = now_date
+                    monitor_state["new_today"] = 0
+
+            new_count = scrape_and_notify()
             with state_lock:
                 monitor_state["last_scrape"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 monitor_state["last_error"] = None
+                monitor_state["new_today"] += new_count
             print(f"[{datetime.now().isoformat(timespec='seconds')}] New listings: {new_count}")
         except Exception as exc:
             with state_lock:
                 monitor_state["last_error"] = str(exc)
             print(f"Scrape error: {exc}")
-        sleep_seconds = random.randint(SLEEP_MIN_SECONDS, SLEEP_MAX_SECONDS)
-        time.sleep(sleep_seconds)
+
+        time.sleep(SCRAPE_INTERVAL_SECONDS)
 
 
-@app.route("/")
-def dashboard():
-    conn = get_db_connection()
-    today = datetime.now().strftime("%Y-%m-%d")
-    deals_found_today = conn.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM listings
-        WHERE is_hot_deal = 1 AND substr(created_at, 1, 10) = ?
-        """,
-        (today,),
-    ).fetchone()["count"]
-    conn.close()
-
+@app.get("/")
+def health() -> tuple:
     with state_lock:
-        running = monitor_state["running"]
-        last_scrape = monitor_state["last_scrape"] or "Never"
-        last_error = monitor_state["last_error"] or "None"
-
-    html = """
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Kijiji Car Monitor</title>
-        <style>
-          body { font-family: Arial, sans-serif; background: #f7f9fc; margin: 0; padding: 24px; }
-          .wrap { max-width: 760px; margin: 0 auto; }
-          .title { font-size: 28px; margin-bottom: 20px; font-weight: 700; }
-          .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
-          .card { background: #fff; border-radius: 10px; padding: 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-          .label { color: #667085; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
-          .value { font-size: 21px; margin-top: 6px; }
-          .ok { color: #0f9d58; }
-          .err { color: #d93025; }
-        </style>
-      </head>
-      <body>
-        <div class="wrap">
-          <div class="title">Kijiji Toronto Car Monitor</div>
-          <div class="grid">
-            <div class="card">
-              <div class="label">System Status</div>
-              <div class="value {{ 'ok' if running else 'err' }}">{{ 'Running' if running else 'Stopped' }}</div>
-            </div>
-            <div class="card">
-              <div class="label">Last Scrape Time</div>
-              <div class="value">{{ last_scrape }}</div>
-            </div>
-            <div class="card">
-              <div class="label">Deals Found Today</div>
-              <div class="value">{{ deals_found_today }}</div>
-            </div>
-            <div class="card">
-              <div class="label">Last Error</div>
-              <div class="value {{ 'err' if last_error != 'None' else '' }}">{{ last_error }}</div>
-            </div>
-          </div>
-        </div>
-      </body>
-    </html>
-    """
-    return render_template_string(
-        html,
-        running=running,
-        last_scrape=last_scrape,
-        deals_found_today=deals_found_today,
-        last_error=last_error,
-    )
+        return (
+            jsonify(
+                {
+                    "status": "running" if monitor_state["running"] else "starting",
+                    "last_scrape": monitor_state["last_scrape"],
+                    "last_error": monitor_state["last_error"],
+                    "new_today": monitor_state["new_today"],
+                    "interval_seconds": SCRAPE_INTERVAL_SECONDS,
+                }
+            ),
+            200,
+        )
 
 
 def main() -> None:
-    global MARKET_REFERENCE
-    MARKET_REFERENCE = load_market_reference()
     init_db()
-    scraper_thread = threading.Thread(target=monitor_loop, daemon=True)
-    scraper_thread.start()
+    thread = threading.Thread(target=monitor_loop, daemon=True)
+    thread.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
 
