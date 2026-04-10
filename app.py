@@ -7,7 +7,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from html import unescape
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,6 +20,7 @@ load_dotenv()
 KIJIJI_URL = "https://www.kijiji.ca/b-cars-trucks/toronto/c174l1700273"
 DB_PATH = "kijiji_seen.db"
 SCRAPE_INTERVAL_SECONDS = 300  # 5 minutes
+AUTOTRADER_REQUEST_TIMEOUT = 15
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -39,6 +41,49 @@ monitor_state = {
     "today_date": datetime.now().strftime("%Y-%m-%d"),
 }
 state_lock = threading.Lock()
+
+RISK_KEYWORD_PATTERNS = [
+    (r"\baccident(s)?\b", "accident"),
+    (r"\brebuilt\b", "rebuilt"),
+    (r"\bsalvage\b", "salvage"),
+    (r"\bas-is\b", "as-is"),
+    (r"\bas is\b", "as is"),
+    (r"\bno safety\b", "no safety"),
+    (r"\bnot safet(y|ied)\b", "not safety"),
+    (r"\bflood(ed)?\b", "flood"),
+    (r"\blem(on)?\b", "lemon"),
+    (r"\bwrite[- ]?off\b", "write-off"),
+    (r"\bframe damage\b", "frame damage"),
+    (r"\bstructural\b", "structural"),
+    (r"\bparts only\b", "parts only"),
+    (r"\bstolen\b", "stolen"),
+]
+
+HIGHLIGHT_PATTERNS = [
+    (r"\bone owner\b", "one owner"),
+    (r"\bsingle owner\b", "single owner"),
+    (r"\bno accident(s)?\b", "no accidents"),
+    (r"\bclean carfax\b", "clean carfax"),
+    (r"\bcarfax\b", "carfax"),
+    (r"\bcertified\b", "certified"),
+    (r"\bwarranty\b", "warranty"),
+    (r"\bsafety certified\b", "safety certified"),
+    (r"\bpassed safety\b", "passed safety"),
+    (r"\bwith safety\b", "with safety"),
+    (r"\blow km\b", "low km"),
+    (r"\blow mileage\b", "low mileage"),
+]
+
+DEALER_KEYWORDS = (
+    "dealer",
+    "dealership",
+    "omvic",
+    "financing",
+    "car lot",
+    "inventory",
+    "showroom",
+    "commercial",
+)
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -257,6 +302,142 @@ def is_within_6_minutes(posted_text: str) -> bool:
     return minutes <= 6
 
 
+def parse_make_model_year(title: str) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    if not title:
+        return None, None, None
+    parts = title.strip().split()
+    if len(parts) < 3:
+        return None, None, None
+    if not (parts[0].isdigit() and len(parts[0]) == 4):
+        return None, None, None
+    year = int(parts[0])
+    make = parts[1]
+    model = parts[2]
+    return year, make, model
+
+
+def analyze_vehicle(listing: dict) -> dict[str, Any]:
+    title = listing.get("title") or ""
+    description = listing.get("description") or ""
+    combined = f"{title} {description}".lower()
+    mileage = listing.get("mileage")
+
+    seller_type = "私人"
+    if any(keyword in combined for keyword in DEALER_KEYWORDS):
+        seller_type = "经销商"
+
+    risk_hits: list[str] = []
+    for pattern, label in RISK_KEYWORD_PATTERNS:
+        if re.search(pattern, combined, flags=re.IGNORECASE):
+            if label not in risk_hits:
+                risk_hits.append(label)
+
+    highlight_hits: list[str] = []
+    for pattern, label in HIGHLIGHT_PATTERNS:
+        if re.search(pattern, combined, flags=re.IGNORECASE):
+            if label not in highlight_hits:
+                highlight_hits.append(label)
+    if mileage is not None and mileage < 100_000:
+        if "low mileage" not in highlight_hits:
+            highlight_hits.insert(0, "low mileage (<100k km)")
+
+    if risk_hits:
+        rating = "🚨风险"
+    elif highlight_hits or (mileage is not None and mileage < 100_000):
+        rating = "⭐好"
+    else:
+        rating = "⚠️注意"
+
+    risk_text = ",".join(risk_hits) if risk_hits else "无"
+    highlight_text = ",".join(highlight_hits) if highlight_hits else "无"
+    detail = (
+        f"卖家:{seller_type}｜风险词:{risk_text}｜亮点:{highlight_text}"
+    )
+
+    return {
+        "rating": rating,
+        "seller_type": seller_type,
+        "risk_hits": risk_hits,
+        "highlight_hits": highlight_hits,
+        "detail": detail,
+    }
+
+
+def extract_prices_from_autotrader_html(html: str) -> list[int]:
+    prices: list[int] = []
+    match = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.DOTALL
+    )
+    if match:
+        try:
+            data = json.loads(unescape(match.group(1)))
+            blob = json.dumps(data)
+            for found in re.finditer(r'"price"\s*:\s*(\d{4,6})', blob):
+                value = int(found.group(1))
+                if 2_000 <= value <= 500_000:
+                    prices.append(value)
+        except Exception:
+            pass
+    for found in re.finditer(r"\$\s*([\d,]+)", html):
+        value = parse_price(found.group(0))
+        if value and 2_000 <= value <= 500_000:
+            prices.append(value)
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for price in prices:
+        if price not in seen:
+            seen.add(price)
+            ordered.append(price)
+    return ordered
+
+
+def fetch_autotrader_reference_price(
+    year: Optional[int], make: Optional[str], model: Optional[str]
+) -> tuple[Optional[int], Optional[int]]:
+    if not year or not make or not model:
+        return None, None
+    params = {
+        "rcp": "15",
+        "rcs": "0",
+        "srt": "4",
+        "make": make,
+        "model": model,
+        "yRange": f"{year},{year}",
+    }
+    query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params.items())
+    url = f"https://www.autotrader.ca/cars/on/toronto/?{query}"
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-CA,en;q=0.9",
+    }
+    try:
+        response = requests.get(
+            url, headers=headers, timeout=AUTOTRADER_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        html = response.text
+    except Exception:
+        return None, None
+    if len(html) < 2000 or "Incapsula" in html or "_Incapsula_" in html:
+        return None, None
+    prices = extract_prices_from_autotrader_html(html)
+    if not prices:
+        return None, None
+    top = prices[:5]
+    average = sum(top) // len(top)
+    suggested = int(average * 0.9)
+    return average, suggested
+
+
+def enrich_listing_for_push(listing: dict) -> None:
+    listing["analysis"] = analyze_vehicle(listing)
+    year, make, model = parse_make_model_year(listing.get("title", ""))
+    ref, suggested = fetch_autotrader_reference_price(year, make, model)
+    listing["autotrader_ref"] = ref
+    listing["autotrader_suggested"] = suggested
+
+
 def extract_listing(card, posted_time_map: dict[str, str]) -> Optional[dict]:
     listing_id = card.get("data-listing-id") or card.get("data-vip-url")
     title_el = card.select_one('[data-testid="listing-title"], .title, a.title')
@@ -359,14 +540,28 @@ def build_message(listing: dict) -> str:
     year_text = str(listing["year"]) if listing.get("year") else "N/A"
     location_text = listing.get("location") or "N/A"
     posted_text = listing.get("posted_time") or "N/A"
+    analysis = listing.get("analysis") or {}
+    rating = analysis.get("rating", "⚠️注意")
+    detail = analysis.get("detail", "")
+    ref = listing.get("autotrader_ref")
+    suggested = listing.get("autotrader_suggested")
+    if ref is not None and suggested is not None:
+        ref_line = f"💰 AutoTrader参考价：${ref:,}"
+        sug_line = f"💰 建议出价：${suggested:,}"
+    else:
+        ref_line = "💰 AutoTrader参考价：参考价暂无"
+        sug_line = "💰 建议出价：参考价暂无"
     return (
         "🚗 New Listing\n"
         f"Title: {listing['title']}\n"
         f"Price: {price_text}\n"
-        f"Year: {year_text}\n"
-        f"Mileage: {mileage_text} km\n"
+        f"Year: {year_text} | Mileage: {mileage_text} km\n"
         f"Location: {location_text}\n"
         f"Posted: {posted_text}\n"
+        "---\n"
+        f"📊 分析：{rating} {detail}\n"
+        f"{ref_line}\n"
+        f"{sug_line}\n"
         f"Link: {listing['link']}"
     )
 
@@ -379,24 +574,23 @@ def send_telegram(listing: dict) -> bool:
     text = build_message(listing)
     image_url = listing.get("image_url")
 
-    if image_url:
+    if image_url and len(text) <= 1024:
         response = requests.post(
             f"{base_url}/sendPhoto",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "photo": image_url,
-                "caption": text[:1000],
+                "caption": text,
             },
             timeout=20,
         )
         return response.ok
-    else:
-        response = requests.post(
-            f"{base_url}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=20,
-        )
-        return response.ok
+    response = requests.post(
+        f"{base_url}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+        timeout=20,
+    )
+    return response.ok
 
 
 def scrape_and_notify() -> int:
@@ -409,6 +603,7 @@ def scrape_and_notify() -> int:
                 continue
             if is_seen(conn, listing["listing_id"]):
                 continue
+            enrich_listing_for_push(listing)
             sent = send_telegram(listing)
             if not sent:
                 continue
