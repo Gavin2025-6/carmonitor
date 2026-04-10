@@ -17,7 +17,7 @@ from flask import Flask, jsonify
 
 load_dotenv()
 
-KIJIJI_URL = "https://www.kijiji.ca/b-cars-trucks/toronto/c174l1700273"
+KIJIJI_URL = "https://www.kijiji.ca/b-cars-trucks/toronto-gta/c174l1700272"
 DB_PATH = "kijiji_seen.db"
 SCRAPE_INTERVAL_SECONDS = 300  # 5 minutes
 AUTOTRADER_REQUEST_TIMEOUT = 15
