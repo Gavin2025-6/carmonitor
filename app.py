@@ -1,10 +1,12 @@
 import os
+import json
 import random
 import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from html import unescape
 from typing import Optional
 
 import requests
@@ -179,6 +181,55 @@ def extract_posted_time(card) -> str:
     return "N/A"
 
 
+def build_posted_time_map(html: str) -> dict[str, str]:
+    posted_map: dict[str, str] = {}
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return posted_map
+    try:
+        data = json.loads(unescape(match.group(1)))
+        apollo_state = data.get("props", {}).get("pageProps", {}).get("__APOLLO_STATE__", {})
+        for key, value in apollo_state.items():
+            if not isinstance(key, str) or not key.startswith("AutosListing:"):
+                continue
+            if not isinstance(value, dict):
+                continue
+            listing_id = str(value.get("id") or "")
+            sorting_date = value.get("sortingDate")
+            if not listing_id or not sorting_date:
+                continue
+            posted_map[listing_id] = iso_to_relative_posted_time(sorting_date)
+    except Exception:
+        return posted_map
+    return posted_map
+
+
+def iso_to_relative_posted_time(iso_value: str) -> str:
+    try:
+        posted_dt = datetime.fromisoformat(iso_value.replace("Z", "+00:00"))
+        if posted_dt.tzinfo is None:
+            posted_dt = posted_dt.replace(tzinfo=timezone.utc)
+        now_dt = datetime.now(timezone.utc)
+        delta_seconds = max(0, int((now_dt - posted_dt).total_seconds()))
+        minutes = delta_seconds // 60
+        hours = minutes // 60
+        if minutes < 1:
+            return "< 1 minute ago"
+        if minutes == 1:
+            return "1 minute ago"
+        if minutes < 60:
+            return f"{minutes} minutes ago"
+        if hours == 1:
+            return "1 hour ago"
+        return f"{hours} hours ago"
+    except Exception:
+        return "N/A"
+
+
 def posted_time_to_minutes(posted_text: str) -> Optional[int]:
     if not posted_text or posted_text == "N/A":
         return None
@@ -199,14 +250,14 @@ def posted_time_to_minutes(posted_text: str) -> Optional[int]:
     return None
 
 
-def is_within_30_minutes(posted_text: str) -> bool:
+def is_within_6_minutes(posted_text: str) -> bool:
     minutes = posted_time_to_minutes(posted_text)
     if minutes is None:
         return False
-    return minutes <= 30
+    return minutes <= 6
 
 
-def extract_listing(card) -> Optional[dict]:
+def extract_listing(card, posted_time_map: dict[str, str]) -> Optional[dict]:
     listing_id = card.get("data-listing-id") or card.get("data-vip-url")
     title_el = card.select_one('[data-testid="listing-title"], .title, a.title')
     link_el = card.select_one('a[data-testid="listing-link"], a.title, a')
@@ -236,7 +287,7 @@ def extract_listing(card) -> Optional[dict]:
     year = parse_year(title)
     mileage = parse_mileage(full_text)
     location = extract_location(card)
-    posted_time = extract_posted_time(card)
+    posted_time = posted_time_map.get(str(listing_id)) or extract_posted_time(card)
 
     image_url = image_el.get("src") if image_el else None
     if image_url and image_url.startswith("//"):
@@ -261,6 +312,7 @@ def scrape_kijiji() -> list[dict]:
     response = requests.get(KIJIJI_URL, headers=headers, timeout=30)
     response.raise_for_status()
 
+    posted_time_map = build_posted_time_map(response.text)
     soup = BeautifulSoup(response.text, "html.parser")
     cards = soup.select(
         '[data-testid="listing-card"], [data-listing-id], .search-item, .regular-ad'
@@ -269,7 +321,7 @@ def scrape_kijiji() -> list[dict]:
     listings = []
     seen = set()
     for card in cards:
-        data = extract_listing(card)
+        data = extract_listing(card, posted_time_map)
         if not data:
             continue
         if data["listing_id"] in seen:
@@ -353,7 +405,7 @@ def scrape_and_notify() -> int:
     new_count = 0
     try:
         for listing in listings:
-            if not is_within_30_minutes(listing.get("posted_time", "N/A")):
+            if not is_within_6_minutes(listing.get("posted_time", "N/A")):
                 continue
             if is_seen(conn, listing["listing_id"]):
                 continue
