@@ -599,8 +599,6 @@ def scrape_and_notify() -> int:
     new_count = 0
     try:
         for listing in listings:
-            if not is_within_6_minutes(listing.get("posted_time", "N/A")):
-                continue
             if is_seen(conn, listing["listing_id"]):
                 continue
             enrich_listing_for_push(listing)
