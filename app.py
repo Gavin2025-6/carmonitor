@@ -146,8 +146,12 @@ def extract_location(card) -> str:
 
 def extract_posted_time(card) -> str:
     selector_candidates = [
+        '[data-testid="listing-date-value"]',
         '[data-testid="listing-date"]',
         '[data-testid="date-posted"]',
+        '[data-testid="listing-date-and-location"]',
+        '[class*="date-posted"]',
+        '[class*="time"]',
         "time",
         ".date-posted",
     ]
@@ -157,8 +161,49 @@ def extract_posted_time(card) -> str:
             continue
         text = element.get_text(" ", strip=True)
         if text:
-            return text
+            # Prefer relative time text like "< 1 minute ago", "2 hours ago".
+            match = re.search(
+                r"(<\s*1\s*minute\s*ago|\d+\s*(?:minute|minutes|hour|hours|day|days)\s*ago|yesterday)",
+                text.lower(),
+            )
+            if match:
+                return match.group(1)
+
+    full_text = card.get_text(" ", strip=True).lower()
+    match = re.search(
+        r"(<\s*1\s*minute\s*ago|\d+\s*(?:minute|minutes|hour|hours|day|days)\s*ago|yesterday)",
+        full_text,
+    )
+    if match:
+        return match.group(1)
     return "N/A"
+
+
+def posted_time_to_minutes(posted_text: str) -> Optional[int]:
+    if not posted_text or posted_text == "N/A":
+        return None
+    text = posted_text.strip().lower()
+    if re.search(r"<\s*1\s*minute\s*ago", text):
+        return 0
+    minute_match = re.search(r"(\d+)\s*minutes?\s*ago", text)
+    if minute_match:
+        return int(minute_match.group(1))
+    hour_match = re.search(r"(\d+)\s*hours?\s*ago", text)
+    if hour_match:
+        return int(hour_match.group(1)) * 60
+    day_match = re.search(r"(\d+)\s*days?\s*ago", text)
+    if day_match:
+        return int(day_match.group(1)) * 24 * 60
+    if "yesterday" in text:
+        return 24 * 60
+    return None
+
+
+def is_within_30_minutes(posted_text: str) -> bool:
+    minutes = posted_time_to_minutes(posted_text)
+    if minutes is None:
+        return False
+    return minutes <= 30
 
 
 def extract_listing(card) -> Optional[dict]:
@@ -308,6 +353,8 @@ def scrape_and_notify() -> int:
     new_count = 0
     try:
         for listing in listings:
+            if not is_within_30_minutes(listing.get("posted_time", "N/A")):
+                continue
             if is_seen(conn, listing["listing_id"]):
                 continue
             sent = send_telegram(listing)
