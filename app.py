@@ -96,10 +96,74 @@ def parse_mileage(text: str) -> Optional[int]:
     return value
 
 
+def extract_price(card, full_text: str) -> Optional[int]:
+    # Kijiji selectors can change, so use multiple selectors + regex fallback.
+    selector_candidates = [
+        '[data-testid="listing-price"]',
+        '[data-testid="price"]',
+        ".price",
+        ".price-wrapper",
+        '[aria-label*="$"]',
+    ]
+    for selector in selector_candidates:
+        element = card.select_one(selector)
+        if not element:
+            continue
+        value = parse_price(element.get_text(" ", strip=True))
+        if value:
+            return value
+
+    regex_candidates = [
+        r"\$\s?([\d]{1,3}(?:[,\s]\d{3})+|\d{4,6})",
+        r"([\d]{1,3}(?:[,\s]\d{3})+|\d{4,6})\s?\$",
+    ]
+    for pattern in regex_candidates:
+        match = re.search(pattern, full_text)
+        if not match:
+            continue
+        value = parse_price(match.group(0))
+        if value:
+            return value
+    return None
+
+
+def extract_location(card) -> str:
+    selector_candidates = [
+        '[data-testid="listing-location"]',
+        '[data-testid="location"]',
+        ".location",
+        ".item-location",
+    ]
+    for selector in selector_candidates:
+        element = card.select_one(selector)
+        if not element:
+            continue
+        text = element.get_text(" ", strip=True)
+        if text:
+            return text
+    return "N/A"
+
+
+def extract_posted_time(card) -> str:
+    selector_candidates = [
+        '[data-testid="listing-date"]',
+        '[data-testid="date-posted"]',
+        "time",
+        ".date-posted",
+    ]
+    for selector in selector_candidates:
+        element = card.select_one(selector)
+        if not element:
+            continue
+        text = element.get_text(" ", strip=True)
+        if text:
+            return text
+    return "N/A"
+
+
 def extract_listing(card) -> Optional[dict]:
     listing_id = card.get("data-listing-id") or card.get("data-vip-url")
     title_el = card.select_one('[data-testid="listing-title"], .title, a.title')
-    price_el = card.select_one('[data-testid="listing-price"], .price, .price-wrapper')
     link_el = card.select_one('a[data-testid="listing-link"], a.title, a')
     image_el = card.select_one("img")
     desc_el = card.select_one('[data-testid="listing-description"], .description')
@@ -123,9 +187,11 @@ def extract_listing(card) -> Optional[dict]:
     full_text = card.get_text(" ", strip=True)
     description = desc_el.get_text(" ", strip=True) if desc_el else full_text
 
-    price = parse_price(price_el.get_text(" ", strip=True)) if price_el else None
+    price = extract_price(card, full_text)
     year = parse_year(title)
     mileage = parse_mileage(full_text)
+    location = extract_location(card)
+    posted_time = extract_posted_time(card)
 
     image_url = image_el.get("src") if image_el else None
     if image_url and image_url.startswith("//"):
@@ -138,6 +204,8 @@ def extract_listing(card) -> Optional[dict]:
         "year": year,
         "mileage": mileage,
         "description": description,
+        "location": location,
+        "posted_time": posted_time,
         "link": link,
         "image_url": image_url,
     }
@@ -190,30 +258,32 @@ def save_seen(conn: sqlite3.Connection, listing: dict) -> None:
 
 def build_message(listing: dict) -> str:
     price_text = f"${listing['price']:,}" if listing.get("price") else "N/A"
-    mileage_text = (
-        f"{listing['mileage']:,} km" if listing.get("mileage") is not None else "N/A"
-    )
+    mileage_text = f"{listing['mileage']:,}" if listing.get("mileage") is not None else "N/A"
     year_text = str(listing["year"]) if listing.get("year") else "N/A"
+    location_text = listing.get("location") or "N/A"
+    posted_text = listing.get("posted_time") or "N/A"
     return (
-        "🚗 New Kijiji Listing\n"
+        "🚗 New Listing\n"
         f"Title: {listing['title']}\n"
         f"Price: {price_text}\n"
-        f"Mileage: {mileage_text}\n"
         f"Year: {year_text}\n"
+        f"Mileage: {mileage_text} km\n"
+        f"Location: {location_text}\n"
+        f"Posted: {posted_text}\n"
         f"Link: {listing['link']}"
     )
 
 
-def send_telegram(listing: dict) -> None:
+def send_telegram(listing: dict) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     text = build_message(listing)
     image_url = listing.get("image_url")
 
     if image_url:
-        requests.post(
+        response = requests.post(
             f"{base_url}/sendPhoto",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -222,12 +292,14 @@ def send_telegram(listing: dict) -> None:
             },
             timeout=20,
         )
+        return response.ok
     else:
-        requests.post(
+        response = requests.post(
             f"{base_url}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=20,
         )
+        return response.ok
 
 
 def scrape_and_notify() -> int:
@@ -238,8 +310,10 @@ def scrape_and_notify() -> int:
         for listing in listings:
             if is_seen(conn, listing["listing_id"]):
                 continue
+            sent = send_telegram(listing)
+            if not sent:
+                continue
             save_seen(conn, listing)
-            send_telegram(listing)
             new_count += 1
         conn.commit()
     finally:
