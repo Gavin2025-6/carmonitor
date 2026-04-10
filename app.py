@@ -275,31 +275,17 @@ def iso_to_relative_posted_time(iso_value: str) -> str:
         return "N/A"
 
 
-def posted_time_to_minutes(posted_text: str) -> Optional[int]:
+def is_kijiji_posted_within_10_minutes(posted_text: str) -> bool:
+    """Only '< 1 minute ago' or 'X minutes ago' with X<=10 (Kijiji-style). All else skip."""
     if not posted_text or posted_text == "N/A":
-        return None
+        return False
     text = posted_text.strip().lower()
     if re.search(r"<\s*1\s*minute\s*ago", text):
-        return 0
+        return True
     minute_match = re.search(r"(\d+)\s*minutes?\s*ago", text)
     if minute_match:
-        return int(minute_match.group(1))
-    hour_match = re.search(r"(\d+)\s*hours?\s*ago", text)
-    if hour_match:
-        return int(hour_match.group(1)) * 60
-    day_match = re.search(r"(\d+)\s*days?\s*ago", text)
-    if day_match:
-        return int(day_match.group(1)) * 24 * 60
-    if "yesterday" in text:
-        return 24 * 60
-    return None
-
-
-def is_within_6_minutes(posted_text: str) -> bool:
-    minutes = posted_time_to_minutes(posted_text)
-    if minutes is None:
-        return False
-    return minutes <= 6
+        return int(minute_match.group(1)) <= 10
+    return False
 
 
 def parse_make_model_year(title: str) -> tuple[Optional[int], Optional[str], Optional[str]]:
@@ -599,6 +585,10 @@ def scrape_and_notify() -> int:
     new_count = 0
     try:
         for listing in listings:
+            if not is_kijiji_posted_within_10_minutes(
+                listing.get("posted_time") or "N/A"
+            ):
+                continue
             if is_seen(conn, listing["listing_id"]):
                 continue
             enrich_listing_for_push(listing)
