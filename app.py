@@ -207,78 +207,81 @@ def scrape_listings():
     print(f"[scrape] status={r.status_code} url={r.url} content_length={len(r.text)}")
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    cards = soup.select('[data-listing-id], [data-testid="listing-card"], .search-item, .regular-ad')
-    print(f"[scrape] cards found: {len(cards)}")
+
+    # Parse JSON-LD ItemList — far more reliable than CSS selectors
+    items = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+            if data.get("@type") == "ItemList":
+                items = data.get("itemListElement", [])
+                break
+        except Exception:
+            continue
+    print(f"[scrape] JSON-LD items found: {len(items)}")
 
     listings = []
     seen_ids = set()
 
-    for i, card in enumerate(cards):
+    for i, element in enumerate(items):
         try:
-            listing_id = card.get("data-listing-id")
-            title_el = card.select_one('[data-testid="listing-title"], .title, a.title')
-            price_el = card.select_one('[data-testid="listing-price"], .price')
-            link_el = card.select_one('a[data-testid="listing-link"], a.title, a')
-            image_el = card.select_one("img")
-            location_el = card.select_one('[data-testid="listing-location"], .location')
-            time_el = card.select_one('[data-testid="listing-date"], .date-posted, time')
+            item = element.get("item", {})
 
-            if not title_el or not link_el:
-                print(f"[card {i}] SKIP no_title={not title_el} no_link={not link_el}")
-                continue
-
-            title = title_el.get_text(" ", strip=True)
+            title = item.get("name", "").strip()
             if not title:
-                print(f"[card {i}] SKIP empty title")
+                print(f"[item {i}] SKIP empty title")
                 continue
 
-            text = card.get_text(" ", strip=True).upper()
-            hit = next((k for k in BLOCK_KEYWORDS if k in text), None)
+            text_upper = (title + " " + item.get("description", "")).upper()
+            hit = next((k for k in BLOCK_KEYWORDS if k in text_upper), None)
             if hit:
-                print(f"[card {i}] SKIP block_keyword={hit!r} title={title[:40]!r}")
+                print(f"[item {i}] SKIP block_keyword={hit!r} title={title[:40]!r}")
                 continue
 
-            price = parse_price(price_el.get_text() if price_el else "")
+            price = parse_price(item.get("offers", {}).get("price", ""))
             if not price:
-                raw = price_el.get_text() if price_el else "(no price_el)"
-                print(f"[card {i}] SKIP no_price raw={raw!r} title={title[:40]!r}")
+                print(f"[item {i}] SKIP no_price title={title[:40]!r}")
                 continue
 
-            href = link_el.get("href", "")
-            link = f"https://www.kijiji.ca{href}" if href.startswith("/") else href
-            if not link or not listing_id:
-                listing_id = link
+            link = item.get("url", "")
+            if not link:
+                print(f"[item {i}] SKIP no_link title={title[:40]!r}")
+                continue
+
+            # Extract numeric listing ID from URL path (last path segment before query)
+            m = re.search(r'/(\d{6,})', link)
+            listing_id = m.group(1) if m else link
 
             if listing_id in seen_ids:
-                print(f"[card {i}] SKIP dup_id={listing_id!r}")
+                print(f"[item {i}] SKIP dup_id={listing_id!r}")
                 continue
             seen_ids.add(listing_id)
 
-            full_text = card.get_text(" ", strip=True)
-            mileage = parse_mileage(full_text)
-            year = parse_year(title)
-            seller = classify_seller(full_text)
-            location = location_el.get_text(strip=True) if location_el else "N/A"
-            posted_time = time_el.get_text(strip=True) if time_el else "N/A"
-            image_url = image_el.get("src", "") if image_el else ""
-            if image_url.startswith("//"):
-                image_url = f"https:{image_url}"
+            mileage_val = item.get("mileageFromOdometer", {}).get("value")
+            mileage = int(mileage_val) if mileage_val else None
+            year = int(item.get("vehicleModelDate", 0)) or parse_year(title)
+            description = item.get("description", "")
+            seller = classify_seller(description)
+            image_url = item.get("image", "")
+            # location lives in the URL path segment, e.g. /v-cars-trucks/toronto-gta/...
+            loc_m = re.search(r'/v-cars-trucks/([^/]+)/', link)
+            location = loc_m.group(1).replace("-", " ").title() if loc_m else "N/A"
 
             listings.append({
-                "listing_id": str(listing_id),
+                "listing_id": listing_id,
                 "title": title,
                 "price": price,
                 "mileage": mileage,
                 "year": year,
                 "seller": seller,
                 "location": location,
-                "posted_time": posted_time,
+                "posted_time": "N/A",
                 "link": link,
                 "image_url": image_url,
-                "description": full_text,
+                "description": description,
             })
         except Exception as e:
-            print(f"[card {i}] SKIP exception={e}")
+            print(f"[item {i}] SKIP exception={e}")
             continue
 
     return listings
