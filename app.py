@@ -213,7 +213,7 @@ def scrape_listings():
     listings = []
     seen_ids = set()
 
-    for card in cards:
+    for i, card in enumerate(cards):
         try:
             listing_id = card.get("data-listing-id")
             title_el = card.select_one('[data-testid="listing-title"], .title, a.title')
@@ -224,18 +224,24 @@ def scrape_listings():
             time_el = card.select_one('[data-testid="listing-date"], .date-posted, time')
 
             if not title_el or not link_el:
+                print(f"[card {i}] SKIP no_title={not title_el} no_link={not link_el}")
                 continue
 
             title = title_el.get_text(" ", strip=True)
             if not title:
+                print(f"[card {i}] SKIP empty title")
                 continue
 
             text = card.get_text(" ", strip=True).upper()
-            if any(k in text for k in BLOCK_KEYWORDS):
+            hit = next((k for k in BLOCK_KEYWORDS if k in text), None)
+            if hit:
+                print(f"[card {i}] SKIP block_keyword={hit!r} title={title[:40]!r}")
                 continue
 
             price = parse_price(price_el.get_text() if price_el else "")
             if not price:
+                raw = price_el.get_text() if price_el else "(no price_el)"
+                print(f"[card {i}] SKIP no_price raw={raw!r} title={title[:40]!r}")
                 continue
 
             href = link_el.get("href", "")
@@ -244,6 +250,7 @@ def scrape_listings():
                 listing_id = link
 
             if listing_id in seen_ids:
+                print(f"[card {i}] SKIP dup_id={listing_id!r}")
                 continue
             seen_ids.add(listing_id)
 
@@ -270,7 +277,8 @@ def scrape_listings():
                 "image_url": image_url,
                 "description": full_text,
             })
-        except Exception:
+        except Exception as e:
+            print(f"[card {i}] SKIP exception={e}")
             continue
 
     return listings
