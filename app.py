@@ -251,12 +251,13 @@ def get_autotrader_price(year, title):
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
             return None
-        prices = re.findall(r'"price":(\d+)', r.text)
+        prices = re.findall(r'"price":"?(\d+)"?', r.text)
         prices = [int(p) for p in prices if 2000 < int(p) < 500000]
         if len(prices) >= 3:
-            return int(sum(sorted(prices)[:5]) / min(5, len(prices)))
-    except Exception:
-        pass
+            mid = sorted(prices)[len(prices) // 4 : len(prices) * 3 // 4]
+            return int(sum(mid) / len(mid))
+    except Exception as e:
+        print(f"[autotrader] error: {e}")
     return None
 
 
