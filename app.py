@@ -534,7 +534,7 @@ def scrape_cycle():
         date_posted = l.get("posted_time")
         if date_posted and date_posted != "N/A":
             try:
-                posted_dt = datetime.fromisoformat(date_posted).replace(tzinfo=timezone.utc)
+                posted_dt = datetime.fromisoformat(date_posted.replace("Z", "+00:00"))
                 age_seconds = (datetime.now(timezone.utc) - posted_dt).total_seconds()
             except (ValueError, TypeError):
                 pass
