@@ -359,6 +359,9 @@ def scrape_listings():
         except Exception:
             continue
     print(f"[scrape] JSON-LD items found: {len(items)}")
+    if items:
+        print(f"[debug] JSON-LD first item keys: {list(items[0].keys())}")
+        print(f"[debug] JSON-LD first item sample: {dict(list(items[0].items())[:10])}")
 
     listings = []
     seen_ids = set()
