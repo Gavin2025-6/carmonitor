@@ -521,6 +521,7 @@ def scrape_cycle():
         lid = l["listing_id"]
         if is_seen(lid):
             continue
+        print(f"[debug] id={lid!r} datePosted raw={l.get('posted_time')!r}")
         age_seconds = 0
         date_posted = l.get("posted_time")
         if date_posted and date_posted != "N/A":
