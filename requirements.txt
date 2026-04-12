@@ -2,3 +2,4 @@ beautifulsoup4
 Flask
 python-dotenv
 requests
+psycopg2-binary

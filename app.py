@@ -17,9 +17,28 @@ load_dotenv()
 
 KIJIJI_URL = "https://www.kijiji.ca/b-cars-trucks/toronto-gta/c174l1700272"
 DB_PATH = "kijiji_seen.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SLEEP_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# DB abstraction: PostgreSQL when DATABASE_URL is set, else SQLite (local dev)
+# ---------------------------------------------------------------------------
+
+def _pg_conn():
+    import psycopg2
+    # Railway may give postgres:// but psycopg2 needs postgresql://
+    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url)
+
+
+def _sqlite_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def _use_pg():
+    return bool(DATABASE_URL)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -36,38 +55,76 @@ state_lock = threading.Lock()
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
-            listing_id TEXT PRIMARY KEY,
-            title TEXT,
-            price INTEGER,
-            location TEXT,
-            posted_time TEXT,
-            link TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    if _use_pg():
+        conn = _pg_conn()
+        conn.cursor().execute("""
+            CREATE TABLE IF NOT EXISTS seen (
+                listing_id TEXT PRIMARY KEY,
+                title TEXT,
+                price INTEGER,
+                location TEXT,
+                posted_time TEXT,
+                link TEXT,
+                created_at TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("[db] Using PostgreSQL")
+    else:
+        conn = _sqlite_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS seen (
+                listing_id TEXT PRIMARY KEY,
+                title TEXT,
+                price INTEGER,
+                location TEXT,
+                posted_time TEXT,
+                link TEXT,
+                created_at TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("[db] Using SQLite (local)")
 
 
 def is_seen(listing_id):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT 1 FROM seen WHERE listing_id=? LIMIT 1", (listing_id,)).fetchone()
-    conn.close()
+    if _use_pg():
+        conn = _pg_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM seen WHERE listing_id=%s LIMIT 1", (listing_id,))
+        row = cur.fetchone()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        row = conn.execute("SELECT 1 FROM seen WHERE listing_id=? LIMIT 1", (listing_id,)).fetchone()
+        conn.close()
     return row is not None
 
 
 def mark_seen(listing):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT OR IGNORE INTO seen (listing_id, title, price, location, posted_time, link, created_at) VALUES (?,?,?,?,?,?,?)",
-        (listing["listing_id"], listing["title"], listing.get("price"), listing.get("location"),
-         listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
+    if _use_pg():
+        conn = _pg_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO seen (listing_id, title, price, location, posted_time, link, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (listing_id) DO NOTHING""",
+            (listing["listing_id"], listing["title"], listing.get("price"), listing.get("location"),
+             listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO seen (listing_id, title, price, location, posted_time, link, created_at) VALUES (?,?,?,?,?,?,?)",
+            (listing["listing_id"], listing["title"], listing.get("price"), listing.get("location"),
+             listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
 
 
 def parse_price(text):
