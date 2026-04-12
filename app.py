@@ -519,13 +519,21 @@ def scrape_cycle():
     new = 0
     for l in listings:
         lid = l["listing_id"]
-        seen = is_seen(lid)
-        print(f"[cycle] id={lid!r} seen={seen} title={l['title'][:40]!r}")
-        if not seen:
+        if is_seen(lid):
+            continue
+        try:
+            age_seconds = time.time() - int(lid)
+        except (ValueError, TypeError):
+            age_seconds = 0
+        if age_seconds > 600:
+            print(f"[cycle] stale id={lid!r} age={int(age_seconds)}s — mark seen, skip")
             mark_seen(l)
-            send_telegram(l)
-            new += 1
-    print(f"[cycle] done: {new} new, {len(listings) - new} already seen")
+            continue
+        print(f"[cycle] new id={lid!r} age={int(age_seconds)}s title={l['title'][:40]!r}")
+        mark_seen(l)
+        send_telegram(l)
+        new += 1
+    print(f"[cycle] done: {new} new")
     return new
 
 
