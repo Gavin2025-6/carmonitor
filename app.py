@@ -162,77 +162,77 @@ def analyze_listing(title, description, price, mileage, year, seller=None, marke
     mild_accident = any(w in text for w in ["ACCIDENT", "COLLISION", "HIT ", " HIT,", "DAMAGE", "REPAIRED"])
     no_accident_claim = any(w in text for w in ["NO ACCIDENT", "ACCIDENT FREE", "ACCIDENT-FREE", "0 ACCIDENT"])
     if severe_accident:
-        lines.append("🚨 严重事故记录（全损/报废重建）")
+        lines.append("🚨 Accident: Total loss / written off")
     elif mild_accident and not no_accident_claim:
-        lines.append("⚠️ 提及碰撞/事故")
+        lines.append("⚠️ Accident: Collision/damage mentioned")
 
     # 2. Mechanical issues
     mech_words = ["ENGINE", "TRANSMISSION", "LEAK", "NOISE", "ISSUE", "PROBLEM", "AS-IS", "AS IS",
                   "NEEDS WORK", "NOT RUNNING", "ROUGH", "MISFIRE", "OIL BURN"]
     hit_mech = [w for w in mech_words if w in text]
     if hit_mech:
-        lines.append(f"🔧 提及机械问题（{', '.join(w.lower() for w in hit_mech[:3])}）")
+        lines.append(f"🔧 Mechanical: {', '.join(w.lower() for w in hit_mech[:3])} mentioned")
 
     # 3. Mileage assessment
     if mileage is not None:
         if mileage < 80000:
-            lines.append(f"✅ 低里程（{mileage:,} km）")
+            lines.append(f"✅ Low mileage ({mileage:,} km)")
         elif mileage <= 150000:
-            lines.append(f"🟡 里程正常（{mileage:,} km）")
+            lines.append(f"🟡 Average mileage ({mileage:,} km)")
         elif mileage <= 200000:
-            lines.append(f"⚠️ 里程偏高（{mileage:,} km）")
+            lines.append(f"⚠️ High mileage ({mileage:,} km)")
         else:
-            lines.append(f"🔴 高里程慎重（{mileage:,} km）")
+            lines.append(f"🔴 Very high mileage — caution ({mileage:,} km)")
 
     # 4. Vehicle age
     if year:
         age = datetime.now().year - int(year)
         if age > 8:
-            lines.append(f"📅 车龄 {age} 年（{year}款）")
+            lines.append(f"📅 Vehicle age: {age} years ({year})")
 
     # 5. Seller type
     if seller == "DEALER":
-        lines.append("🏪 经销商")
+        lines.append("🏪 Dealer listing")
     else:
-        lines.append("👤 私人卖家")
+        lines.append("👤 Private seller")
 
     # 6. Positive highlights
     highlight_map = {
-        "ONE OWNER": "单一车主",
-        "1 OWNER": "单一车主",
-        "NO ACCIDENT": "无事故记录",
-        "ACCIDENT FREE": "无事故记录",
-        "CLEAN CARFAX": "Carfax 干净",
-        "CERTIFIED": "已认证",
-        "SAFETY": "附安全检查",
-        "LOW KM": "低里程",
-        "WELL MAINTAINED": "保养良好",
+        "ONE OWNER": "one owner",
+        "1 OWNER": "one owner",
+        "NO ACCIDENT": "no accidents",
+        "ACCIDENT FREE": "no accidents",
+        "CLEAN CARFAX": "clean Carfax",
+        "CERTIFIED": "certified",
+        "SAFETY": "safety included",
+        "LOW KM": "low km",
+        "WELL MAINTAINED": "well maintained",
     }
     found = [label for kw, label in highlight_map.items() if kw in text]
     if found:
-        lines.append("✅ 车主声称：" + "、".join(dict.fromkeys(found)))
+        lines.append("✅ Seller claims: " + ", ".join(dict.fromkeys(found)))
 
     # 7. Price vs market
     if market_price and price:
         diff_pct = round((price - market_price) / market_price * 100)
         if diff_pct <= -15:
-            lines.append(f"💚 低于市场价 {abs(diff_pct)}%（市场参考 ${market_price:,}）")
+            lines.append(f"💚 {abs(diff_pct)}% below market (ref: ${market_price:,})")
         elif diff_pct <= -5:
-            lines.append(f"🟢 略低于市场价 {abs(diff_pct)}%（市场参考 ${market_price:,}）")
+            lines.append(f"🟢 Slightly below market ({abs(diff_pct)}% off, ref: ${market_price:,})")
         elif diff_pct <= 5:
-            lines.append(f"🟡 接近市场价（市场参考 ${market_price:,}）")
+            lines.append(f"🟡 Near market price (ref: ${market_price:,})")
         else:
-            lines.append(f"🔴 高于市场价 {diff_pct}%（市场参考 ${market_price:,}）")
+            lines.append(f"🔴 {diff_pct}% above market (ref: ${market_price:,})")
 
     # Overall rating (first line)
     if severe_accident or (mild_accident and not no_accident_claim and hit_mech):
-        rating = "🚨 高风险"
+        rating = "🚨 High Risk"
     elif mild_accident or hit_mech:
-        rating = "⚠️ 需仔细检查"
+        rating = "⚠️ Inspect Carefully"
     elif found or (mileage and mileage < 80000):
-        rating = "⭐ 条件不错"
+        rating = "⭐ Looks Good"
     else:
-        rating = "🔍 一般，需看车"
+        rating = "🔍 Average — worth a look"
 
     return rating, lines
 
@@ -363,19 +363,19 @@ def send_telegram(listing):
         seller=listing.get("seller"), market_price=market_price
     )
 
-    analysis_block = "\n".join(analysis_lines) if analysis_lines else "（无额外信息）"
+    analysis_block = "\n".join(analysis_lines) if analysis_lines else "No additional info"
 
-    price_line = f"💰 要价：{price}"
+    price_line = f"💰 Asking: {price}"
     if market_price:
-        price_line += f" | 市场参考：${market_price:,} | 建议出价：${suggested:,}"
+        price_line += f" | Market ref: ${market_price:,} | Suggested offer: ${suggested:,}"
 
     text = (
-        f"🚗 新车源\n"
+        f"🚗 New Listing\n"
         f"📌 {listing['title']}\n"
         f"{price_line}\n"
         f"📍 {listing.get('location', 'N/A')}\n"
         f"\n"
-        f"📊 综合评级：{rating}\n"
+        f"📊 Rating: {rating}\n"
         f"{analysis_block}\n"
         f"\n"
         f"🔗 {listing['link']}"
