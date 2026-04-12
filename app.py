@@ -225,7 +225,7 @@ def analyze_listing(title, description, price, mileage, year, seller=None, marke
     return rating, lines
 
 
-def get_autotrader_price(year, title):
+def get_autotrader_price(year, title, mileage=None, has_accident=False):
     try:
         words = title.lower().split()
         makes = ["honda", "toyota", "ford", "chevrolet", "nissan", "hyundai", "kia", "mazda",
@@ -253,10 +253,15 @@ def get_autotrader_price(year, title):
         if not make or not year:
             return None
         model = next((m for m in models.get(make, []) if m in title.lower()), None)
-        if model:
-            url = f"https://www.autotrader.ca/cars/{make}/{model}/?rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
-        else:
-            url = f"https://www.autotrader.ca/cars/{make}/?rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
+        base = f"https://www.autotrader.ca/cars/{make}/{model}/" if model else f"https://www.autotrader.ca/cars/{make}/"
+        params = f"rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
+        if mileage:
+            ome = max(0, mileage - 15000)
+            ome2 = mileage + 15000
+            params += f"&ome={ome}&ome2={ome2}"
+        if not has_accident:
+            params += "&withoutAccident=1"
+        url = f"{base}?{params}"
         print(f"[autotrader] fetching: {url}")
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         r = requests.get(url, headers=headers, timeout=15)
@@ -368,7 +373,13 @@ def send_telegram(listing):
     price_val = listing.get("price")
     price = f"${price_val:,}" if price_val else "N/A"
 
-    market_price = get_autotrader_price(listing.get("year"), listing["title"])
+    desc_upper = (listing["title"] + " " + listing.get("description", "")).upper()
+    has_accident = any(w in desc_upper for w in ["ACCIDENT", "COLLISION", "DAMAGE", "REPAIRED", "TOTAL LOSS", "WRITTEN OFF"])
+    has_accident = has_accident and not any(w in desc_upper for w in ["NO ACCIDENT", "ACCIDENT FREE", "0 ACCIDENT"])
+    market_price = get_autotrader_price(
+        listing.get("year"), listing["title"],
+        mileage=listing.get("mileage"), has_accident=has_accident
+    )
 
     rating, analysis_lines = analyze_listing(
         listing["title"], listing.get("description", ""),
