@@ -345,15 +345,12 @@ def scrape_listings():
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     r = requests.get(KIJIJI_URL, headers=headers, timeout=30)
     print(f"[scrape] status={r.status_code} url={r.url} content_length={len(r.text)}")
-    ids = re.findall(r'"adId"\s*:\s*"(\d+)"', r.text)
-    print(f"[debug] adId samples: {ids[:3]}")
-    for field in ['activationDate', 'listingCreateDate', 'postedDate', 'datePosted', 'createdOn', 'sortingDate']:
-        matches = re.findall(rf'"{field}"\s*:\s*"([^"]+)"', r.text)
-        if matches:
-            print(f"[debug] found field={field!r} samples={matches[:2]}")
-        else:
-            print(f"[debug] missing field={field!r}")
     r.raise_for_status()
+    # Build id→activationDate map from inline JS (more reliable than JSON-LD datePosted)
+    activation_dates = {}
+    for m in re.finditer(r'/(\d{6,})"[^}]*?"activationDate"\s*:\s*"([^"]+)"', r.text):
+        activation_dates[m.group(1)] = m.group(2)
+    print(f"[scrape] activation_dates found: {len(activation_dates)}, samples: {list(activation_dates.items())[:2]}")
     soup = BeautifulSoup(r.text, "html.parser")
 
     # Parse JSON-LD ItemList — far more reliable than CSS selectors
@@ -426,7 +423,7 @@ def scrape_listings():
                 "year": year,
                 "seller": seller,
                 "location": location,
-                "posted_time": item.get("datePosted", "N/A"),
+                "posted_time": activation_dates.get(listing_id, item.get("datePosted", "N/A")),
                 "link": link,
                 "image_url": image_url,
                 "description": description,
