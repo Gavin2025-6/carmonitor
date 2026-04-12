@@ -345,10 +345,14 @@ def scrape_listings():
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     r = requests.get(KIJIJI_URL, headers=headers, timeout=30)
     print(f"[scrape] status={r.status_code} url={r.url} content_length={len(r.text)}")
-    dates = re.findall(r'"sortingDate"\s*:\s*"([^"]+)"', r.text)
     ids = re.findall(r'"adId"\s*:\s*"(\d+)"', r.text)
-    print(f"[debug] sortingDate samples: {dates[:3]}")
     print(f"[debug] adId samples: {ids[:3]}")
+    for field in ['activationDate', 'listingCreateDate', 'postedDate', 'datePosted', 'createdOn', 'sortingDate']:
+        matches = re.findall(rf'"{field}"\s*:\s*"([^"]+)"', r.text)
+        if matches:
+            print(f"[debug] found field={field!r} samples={matches[:2]}")
+        else:
+            print(f"[debug] missing field={field!r}")
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
