@@ -212,18 +212,6 @@ def analyze_listing(title, description, price, mileage, year, seller=None, marke
     if found:
         lines.append("✅ Seller claims: " + ", ".join(dict.fromkeys(found)))
 
-    # 7. Price vs market
-    if market_price and price:
-        diff_pct = round((price - market_price) / market_price * 100)
-        if diff_pct <= -15:
-            lines.append(f"💚 {abs(diff_pct)}% below market (ref: ${market_price:,})")
-        elif diff_pct <= -5:
-            lines.append(f"🟢 Slightly below market ({abs(diff_pct)}% off, ref: ${market_price:,})")
-        elif diff_pct <= 5:
-            lines.append(f"🟡 Near market price (ref: ${market_price:,})")
-        else:
-            lines.append(f"🔴 {diff_pct}% above market (ref: ${market_price:,})")
-
     # Overall rating (first line)
     if severe_accident or (mild_accident and not no_accident_claim and hit_mech):
         rating = "🚨 High Risk"
@@ -243,16 +231,41 @@ def get_autotrader_price(year, title):
         makes = ["honda", "toyota", "ford", "chevrolet", "nissan", "hyundai", "kia", "mazda",
                  "bmw", "mercedes", "audi", "volkswagen", "jeep", "ram", "dodge", "subaru",
                  "lexus", "acura", "infiniti", "volvo", "gmc", "buick", "cadillac"]
+        models = {
+            "honda": ["civic", "accord", "crv", "cr-v", "hrv", "hr-v", "pilot", "odyssey", "fit", "ridgeline"],
+            "toyota": ["camry", "corolla", "rav4", "highlander", "prius", "sienna", "tacoma", "tundra", "4runner", "venza"],
+            "ford": ["f-150", "f150", "escape", "explorer", "edge", "fusion", "mustang", "bronco", "ranger"],
+            "chevrolet": ["silverado", "equinox", "traverse", "malibu", "trax", "blazer", "tahoe", "suburban"],
+            "nissan": ["altima", "sentra", "rogue", "murano", "pathfinder", "frontier", "maxima", "kicks", "qashqai"],
+            "hyundai": ["elantra", "sonata", "tucson", "santa", "kona", "ioniq", "palisade", "venue"],
+            "kia": ["forte", "optima", "sportage", "sorento", "soul", "telluride", "carnival", "stinger"],
+            "mazda": ["mazda3", "mazda6", "cx-3", "cx-5", "cx-9", "cx-30", "mx-5"],
+            "bmw": ["3", "5", "7", "x3", "x5", "x1", "x7", "4", "2"],
+            "mercedes": ["c-class", "e-class", "glc", "gle", "gla", "cla", "s-class"],
+            "audi": ["a3", "a4", "a6", "q3", "q5", "q7", "q8"],
+            "volkswagen": ["jetta", "golf", "passat", "tiguan", "atlas", "id.4"],
+            "jeep": ["wrangler", "cherokee", "grand", "compass", "renegade", "gladiator"],
+            "subaru": ["impreza", "legacy", "outback", "forester", "crosstrek", "wrx", "ascent"],
+            "lexus": ["rx", "es", "nx", "is", "ux", "gx", "lx"],
+            "acura": ["mdx", "rdx", "tlx", "ilx", "tsx"],
+        }
         make = next((w for w in words if w in makes), None)
         if not make or not year:
             return None
-        url = f"https://www.autotrader.ca/cars/{make}/?rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
+        model = next((m for m in models.get(make, []) if m in title.lower()), None)
+        if model:
+            url = f"https://www.autotrader.ca/cars/{make}/{model}/?rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
+        else:
+            url = f"https://www.autotrader.ca/cars/{make}/?rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
+        print(f"[autotrader] fetching: {url}")
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
+            print(f"[autotrader] status={r.status_code}")
             return None
         prices = re.findall(r'"price":"?(\d+)"?', r.text)
         prices = [int(p) for p in prices if 2000 < int(p) < 500000]
+        print(f"[autotrader] found {len(prices)} prices: {sorted(prices)[:8]}")
         if len(prices) >= 3:
             mid = sorted(prices)[len(prices) // 4 : len(prices) * 3 // 4]
             return int(sum(mid) / len(mid))
@@ -356,7 +369,6 @@ def send_telegram(listing):
     price = f"${price_val:,}" if price_val else "N/A"
 
     market_price = get_autotrader_price(listing.get("year"), listing["title"])
-    suggested = int(market_price * 0.9) if market_price else None
 
     rating, analysis_lines = analyze_listing(
         listing["title"], listing.get("description", ""),
@@ -367,8 +379,13 @@ def send_telegram(listing):
     analysis_block = "\n".join(analysis_lines) if analysis_lines else "No additional info"
 
     price_line = f"💰 Asking: {price}"
-    if market_price:
-        price_line += f" | Market ref: ${market_price:,} | Suggested offer: ${suggested:,}"
+    if market_price and price_val:
+        if price_val <= market_price:
+            diff_pct = round((market_price - price_val) / market_price * 100)
+            price_line += f" | 💚 {diff_pct}% below market (ref: ${market_price:,})"
+        else:
+            suggested = int(market_price * 0.9)
+            price_line += f"\n💡 Suggested offer: ${suggested:,} (market ref: ${market_price:,})"
 
     text = (
         f"🚗 New Listing\n"
