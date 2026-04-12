@@ -147,9 +147,11 @@ def get_autotrader_price(year, title):
 def scrape_listings():
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     r = requests.get(KIJIJI_URL, headers=headers, timeout=30)
+    print(f"[scrape] status={r.status_code} url={r.url} content_length={len(r.text)}")
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     cards = soup.select('[data-listing-id], [data-testid="listing-card"], .search-item, .regular-ad')
+    print(f"[scrape] cards found: {len(cards)}")
 
     listings = []
     seen_ids = set()
