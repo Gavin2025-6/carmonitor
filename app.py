@@ -6,7 +6,7 @@ import sqlite3
 import statistics
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -415,7 +415,7 @@ def scrape_listings():
                 "year": year,
                 "seller": seller,
                 "location": location,
-                "posted_time": "N/A",
+                "posted_time": item.get("datePosted", "N/A"),
                 "link": link,
                 "image_url": image_url,
                 "description": description,
@@ -521,10 +521,14 @@ def scrape_cycle():
         lid = l["listing_id"]
         if is_seen(lid):
             continue
-        try:
-            age_seconds = time.time() - int(lid)
-        except (ValueError, TypeError):
-            age_seconds = 0
+        age_seconds = 0
+        date_posted = l.get("posted_time")
+        if date_posted and date_posted != "N/A":
+            try:
+                posted_dt = datetime.fromisoformat(date_posted).replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - posted_dt).total_seconds()
+            except (ValueError, TypeError):
+                pass
         if age_seconds > 600:
             print(f"[cycle] stale id={lid!r} age={int(age_seconds)}s — mark seen, skip")
             mark_seen(l)
