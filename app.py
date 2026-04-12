@@ -260,20 +260,34 @@ def send_telegram(listing):
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     img = listing.get("image_url", "")
 
+    def send_message():
+        resp = requests.post(f"{base}/sendMessage", json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text[:4096]
+        }, timeout=20)
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"Telegram sendMessage error: {data}")
+
     try:
         if img and img.startswith("http"):
-            requests.post(f"{base}/sendPhoto", json={
+            resp = requests.post(f"{base}/sendPhoto", json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "photo": img,
                 "caption": text[:1024]
             }, timeout=20)
+            data = resp.json()
+            if not data.get("ok"):
+                print(f"Telegram sendPhoto failed ({data.get('description')}), falling back to sendMessage")
+                send_message()
         else:
-            requests.post(f"{base}/sendMessage", json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text
-            }, timeout=20)
+            send_message()
     except Exception as e:
         print(f"Telegram error: {e}")
+        try:
+            send_message()
+        except Exception as e2:
+            print(f"Telegram fallback error: {e2}")
 
 
 def scrape_cycle():
