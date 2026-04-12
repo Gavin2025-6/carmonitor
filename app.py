@@ -225,54 +225,101 @@ def analyze_listing(title, description, price, mileage, year, seller=None, marke
     return rating, lines
 
 
+MAKES = ["honda", "toyota", "ford", "chevrolet", "nissan", "hyundai", "kia", "mazda",
+         "bmw", "mercedes", "audi", "volkswagen", "jeep", "ram", "dodge", "subaru",
+         "lexus", "acura", "infiniti", "volvo", "gmc", "buick", "cadillac"]
+
+_models_cache: dict = {}  # {make: {"entries": [(name, slug), ...], "ts": float}}
+
+
+def _name_to_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def fetch_autotrader_models(make: str):
+    """Return list of (display_name, url_slug) for a make, cached 24 h."""
+    now = time.time()
+    cached = _models_cache.get(make)
+    if cached and now - cached["ts"] < 86400:
+        return cached["entries"]
+    try:
+        url = f"https://www.autotrader.ca/cars/{make}/"
+        r = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=15)
+        if r.status_code != 200:
+            print(f"[autotrader_models] {make} status={r.status_code}")
+            return _models_cache.get(make, {}).get("entries", [])
+        # Model names live in the GTM dataLayer as "model":"Civic Hatchback"
+        names = re.findall(r'"model":"([^"]+)"', r.text)
+        # Deduplicate preserving order; skip suspiciously long strings (ads noise)
+        seen, entries = set(), []
+        for name in names:
+            key = name.lower()
+            if key not in seen and len(name) < 40:
+                seen.add(key)
+                entries.append((name, _name_to_slug(name)))
+        _models_cache[make] = {"entries": entries, "ts": now}
+        print(f"[autotrader_models] {make}: {len(entries)} models — {[n for n,_ in entries[:6]]}")
+        return entries
+    except Exception as e:
+        print(f"[autotrader_models] error for {make}: {e}")
+        return _models_cache.get(make, {}).get("entries", [])
+
+
+def _find_model_slug(make: str, title: str) -> Optional[str]:
+    """Match listing title against fetched model names; return best slug or None."""
+    entries = fetch_autotrader_models(make)
+    title_lower = title.lower()
+    best_name, best_slug = "", None
+    for name, slug in entries:
+        name_lower = name.lower()
+        if name_lower in title_lower and len(name_lower) > len(best_name):
+            best_name, best_slug = name_lower, slug
+    return best_slug
+
+
+def _fetch_prices(url: str) -> list:
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    r = requests.get(url, headers=headers, timeout=15)
+    if r.status_code != 200:
+        print(f"[autotrader] status={r.status_code} url={url}")
+        return []
+    prices = re.findall(r'"price":"?(\d+)"?', r.text)
+    return [int(p) for p in prices if 2000 < int(p) < 500000]
+
+
 def get_autotrader_price(year, title, mileage=None, has_accident=False):
     try:
         words = title.lower().split()
-        makes = ["honda", "toyota", "ford", "chevrolet", "nissan", "hyundai", "kia", "mazda",
-                 "bmw", "mercedes", "audi", "volkswagen", "jeep", "ram", "dodge", "subaru",
-                 "lexus", "acura", "infiniti", "volvo", "gmc", "buick", "cadillac"]
-        models = {
-            "honda": ["civic", "accord", "crv", "cr-v", "hrv", "hr-v", "pilot", "odyssey", "fit", "ridgeline"],
-            "toyota": ["camry", "corolla", "rav4", "highlander", "prius", "sienna", "tacoma", "tundra", "4runner", "venza"],
-            "ford": ["f-150", "f150", "escape", "explorer", "edge", "fusion", "mustang", "bronco", "ranger"],
-            "chevrolet": ["silverado", "equinox", "traverse", "malibu", "trax", "blazer", "tahoe", "suburban"],
-            "nissan": ["altima", "sentra", "rogue", "murano", "pathfinder", "frontier", "maxima", "kicks", "qashqai"],
-            "hyundai": ["elantra", "sonata", "tucson", "santa", "kona", "ioniq", "palisade", "venue"],
-            "kia": ["forte", "optima", "sportage", "sorento", "soul", "telluride", "carnival", "stinger"],
-            "mazda": ["mazda3", "mazda6", "cx-3", "cx-5", "cx-9", "cx-30", "mx-5"],
-            "bmw": ["3", "5", "7", "x3", "x5", "x1", "x7", "4", "2"],
-            "mercedes": ["c-class", "e-class", "glc", "gle", "gla", "cla", "s-class"],
-            "audi": ["a3", "a4", "a6", "q3", "q5", "q7", "q8"],
-            "volkswagen": ["jetta", "golf", "passat", "tiguan", "atlas", "id.4"],
-            "jeep": ["wrangler", "cherokee", "grand", "compass", "renegade", "gladiator"],
-            "subaru": ["impreza", "legacy", "outback", "forester", "crosstrek", "wrx", "ascent"],
-            "lexus": ["rx", "es", "nx", "is", "ux", "gx", "lx"],
-            "acura": ["mdx", "rdx", "tlx", "ilx", "tsx"],
-        }
-        make = next((w for w in words if w in makes), None)
+        make = next((w for w in words if w in MAKES), None)
         if not make or not year:
             return None
-        model = next((m for m in models.get(make, []) if m in title.lower()), None)
-        base = f"https://www.autotrader.ca/cars/{make}/{model}/" if model else f"https://www.autotrader.ca/cars/{make}/"
-        params = f"rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
-        if mileage:
-            ome = max(0, mileage - 15000)
-            ome2 = mileage + 15000
-            params += f"&ome={ome}&ome2={ome2}"
-        if not has_accident:
-            params += "&withoutAccident=1"
-        url = f"{base}?{params}"
+
+        model_slug = _find_model_slug(make, title)
+
+        def build_url(with_model: bool) -> str:
+            base = (f"https://www.autotrader.ca/cars/{make}/{model_slug}/"
+                    if with_model and model_slug
+                    else f"https://www.autotrader.ca/cars/{make}/")
+            params = f"rcp=15&rcs=0&prx=100&loc=Toronto&year={year}&year2={year}"
+            if mileage:
+                params += f"&ome={max(0, mileage - 15000)}&ome2={mileage + 15000}"
+            if not has_accident:
+                params += "&withoutAccident=1"
+            return f"{base}?{params}"
+
+        url = build_url(with_model=True)
         print(f"[autotrader] fetching: {url}")
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200:
-            print(f"[autotrader] status={r.status_code}")
-            return None
-        prices = re.findall(r'"price":"?(\d+)"?', r.text)
-        prices = [int(p) for p in prices if 2000 < int(p) < 500000]
-        print(f"[autotrader] found {len(prices)} prices: {sorted(prices)[:8]}")
+        prices = _fetch_prices(url)
+
+        # Fallback: drop model slug if too few results
+        if len(prices) < 3 and model_slug:
+            url = build_url(with_model=False)
+            print(f"[autotrader] fallback (no model): {url}")
+            prices = _fetch_prices(url)
+
+        print(f"[autotrader] {len(prices)} prices: {sorted(prices)[:8]}")
         if len(prices) >= 3:
-            mid = sorted(prices)[len(prices) // 4 : len(prices) * 3 // 4]
+            mid = sorted(prices)[len(prices) // 4: len(prices) * 3 // 4]
             return int(sum(mid) / len(mid))
     except Exception as e:
         print(f"[autotrader] error: {e}")
