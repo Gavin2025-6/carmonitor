@@ -351,12 +351,17 @@ def send_telegram(listing):
 
 def scrape_cycle():
     listings = scrape_listings()
+    print(f"[cycle] total listings after scrape: {len(listings)}")
     new = 0
     for l in listings:
-        if not is_seen(l["listing_id"]):
+        lid = l["listing_id"]
+        seen = is_seen(lid)
+        print(f"[cycle] id={lid!r} seen={seen} title={l['title'][:40]!r}")
+        if not seen:
             mark_seen(l)
             send_telegram(l)
             new += 1
+    print(f"[cycle] done: {new} new, {len(listings) - new} already seen")
     return new
 
 
