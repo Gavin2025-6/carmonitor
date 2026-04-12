@@ -3,6 +3,7 @@ import json
 import random
 import re
 import sqlite3
+import statistics
 import threading
 import time
 from datetime import datetime
@@ -292,7 +293,7 @@ def get_autotrader_price(year, title, mileage=None, has_accident=False):
         words = title.lower().split()
         make = next((w for w in words if w in MAKES), None)
         if not make or not year:
-            return None
+            return None, "Rare Find"
 
         model_slug = _find_model_slug(make, title)
 
@@ -318,12 +319,26 @@ def get_autotrader_price(year, title, mileage=None, has_accident=False):
             prices = _fetch_prices(url)
 
         print(f"[autotrader] {len(prices)} prices: {sorted(prices)[:8]}")
-        if len(prices) >= 3:
-            mid = sorted(prices)[len(prices) // 4: len(prices) * 3 // 4]
-            return int(sum(mid) / len(mid))
+
+        n = len(prices)
+        if n < 3:
+            return None, "Rare Find"
+
+        cv = statistics.stdev(prices) / statistics.mean(prices)
+
+        if n < 5:
+            if cv > 0.25:
+                return None, "Rare Find"
+            label = None
+        else:
+            label = "⚠️ Wide price range" if cv > 0.35 else None
+
+        mid = sorted(prices)[n // 4: n * 3 // 4]
+        return int(sum(mid) / len(mid)), label
+
     except Exception as e:
         print(f"[autotrader] error: {e}")
-    return None
+    return None, "Rare Find"
 
 
 def scrape_listings():
@@ -423,7 +438,7 @@ def send_telegram(listing):
     desc_upper = (listing["title"] + " " + listing.get("description", "")).upper()
     has_accident = any(w in desc_upper for w in ["ACCIDENT", "COLLISION", "DAMAGE", "REPAIRED", "TOTAL LOSS", "WRITTEN OFF"])
     has_accident = has_accident and not any(w in desc_upper for w in ["NO ACCIDENT", "ACCIDENT FREE", "0 ACCIDENT"])
-    market_price = get_autotrader_price(
+    market_price, market_label = get_autotrader_price(
         listing.get("year"), listing["title"],
         mileage=listing.get("mileage"), has_accident=has_accident
     )
@@ -434,7 +449,15 @@ def send_telegram(listing):
         seller=listing.get("seller"), market_price=market_price
     )
 
+    # Override rating for Rare Find
+    if market_label == "Rare Find":
+        rating = "🔍 Rare Find — limited market data"
+
     analysis_block = "\n".join(analysis_lines) if analysis_lines else "No additional info"
+
+    # Append wide-range warning to analysis block
+    if market_label == "⚠️ Wide price range":
+        analysis_block += "\n⚠️ Wide price range"
 
     price_line = f"💰 Asking: {price}"
     if market_price and price_val:
