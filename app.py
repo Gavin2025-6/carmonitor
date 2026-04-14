@@ -199,32 +199,19 @@ def get_today_total():
     return row[0] if row else 0
 
 
-def backfill_daily_counts():
-    """Populate daily_counts from seen.created_at, overwriting with accurate counts."""
+def clear_daily_counts():
+    """Wipe daily_counts so only real Telegram sends are counted from now on."""
     if _use_pg():
         conn = _pg_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO daily_counts (date, count)
-            SELECT DATE(created_at), COUNT(*)
-            FROM seen
-            GROUP BY DATE(created_at)
-            ON CONFLICT (date) DO UPDATE SET count = EXCLUDED.count
-        """)
+        conn.cursor().execute("DELETE FROM daily_counts")
         conn.commit()
         conn.close()
     else:
         conn = _sqlite_conn()
-        conn.execute("""
-            INSERT INTO daily_counts (date, count)
-            SELECT DATE(created_at), COUNT(*)
-            FROM seen
-            GROUP BY DATE(created_at)
-            ON CONFLICT (date) DO UPDATE SET count = EXCLUDED.count
-        """)
+        conn.execute("DELETE FROM daily_counts")
         conn.commit()
         conn.close()
-    print("[db] backfill_daily_counts done")
+    print("[db] daily_counts cleared")
 
 
 def parse_price(text):
@@ -754,7 +741,7 @@ h1{{font-size:24px;margin-bottom:20px}}
 
 def main():
     init_db()
-    backfill_daily_counts()
+    clear_daily_counts()
     t = threading.Thread(target=monitor_loop, daemon=True)
     t.start()
     port = int(os.getenv("PORT", "8080"))
