@@ -1,3 +1,4 @@
+import calendar
 import os
 import json
 import random
@@ -586,7 +587,7 @@ def send_telegram(listing):
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     img = listing.get("image_url", "")
 
-    def send_message():
+    def send_message() -> bool:
         resp = requests.post(f"{base}/sendMessage", json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text[:4096]
@@ -594,7 +595,10 @@ def send_telegram(listing):
         data = resp.json()
         if not data.get("ok"):
             print(f"Telegram sendMessage error: {data}")
+            return False
+        return True
 
+    sent = False
     try:
         if img and img.startswith("http"):
             resp = requests.post(f"{base}/sendPhoto", json={
@@ -603,17 +607,22 @@ def send_telegram(listing):
                 "caption": text[:1024]
             }, timeout=20)
             data = resp.json()
-            if not data.get("ok"):
+            if data.get("ok"):
+                sent = True
+            else:
                 print(f"Telegram sendPhoto failed ({data.get('description')}), falling back to sendMessage")
-                send_message()
+                sent = send_message()
         else:
-            send_message()
+            sent = send_message()
     except Exception as e:
         print(f"Telegram error: {e}")
         try:
-            send_message()
+            sent = send_message()
         except Exception as e2:
             print(f"Telegram fallback error: {e2}")
+
+    if sent:
+        increment_daily_count()
 
 
 def scrape_cycle():
@@ -639,7 +648,6 @@ def scrape_cycle():
         print(f"[cycle] new id={lid!r} age={int(age_seconds)}s title={l['title'][:40]!r}")
         mark_seen(l)
         send_telegram(l)
-        increment_daily_count()
         new += 1
     print(f"[cycle] done: {new} new")
     return new
@@ -663,6 +671,34 @@ def monitor_loop():
         time.sleep(SLEEP_SECONDS)
 
 
+def _build_calendar(counts: dict) -> str:
+    now = datetime.now(timezone.utc)
+    year, month = now.year, now.month
+    month_name = now.strftime("%B %Y")
+    today_day = now.day
+
+    header = "".join(f"<th>{d}</th>" for d in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"])
+    rows = []
+    for week in calendar.monthcalendar(year, month):
+        cells = []
+        for day in week:
+            if day == 0:
+                cells.append('<td class="cal-empty"></td>')
+            else:
+                date_str = f"{year}-{month:02d}-{day:02d}"
+                count = counts.get(date_str, 0)
+                extra = " cal-today" if day == today_day else ""
+                badge = f'<span class="cal-n{"pos" if count else ""}">{count}</span>'
+                cells.append(f'<td class="cal-day{extra}"><span class="cal-d">{day}</span>{badge}</td>')
+        rows.append(f'<tr>{"".join(cells)}</tr>')
+
+    return (
+        f'<div class="cal-title">{month_name}</div>'
+        f'<table class="cal"><thead><tr>{header}</tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+    )
+
+
 @app.route("/")
 def dashboard():
     with state_lock:
@@ -671,23 +707,14 @@ def dashboard():
         error = monitor_state["last_error"] or "None"
 
     try:
-        daily_rows = get_daily_counts(days=14)
+        daily_rows = get_daily_counts(days=62)
         new_today = get_today_total()
     except Exception:
         daily_rows = []
         new_today = 0
 
-    def fmt_date(d):
-        try:
-            return datetime.strptime(d, "%Y-%m-%d").strftime("%b %d")
-        except Exception:
-            return d
-
-    daily_html = "".join(
-        f'<div class="day-row"><span class="day-label">{fmt_date(d)}</span>'
-        f'<span class="day-count">{c} listings</span></div>'
-        for d, c in daily_rows
-    ) or "<div style='color:#8b949e'>No data yet</div>"
+    counts = {d: c for d, c in daily_rows}
+    cal_html = _build_calendar(counts)
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Car Monitor</title>
@@ -696,22 +723,28 @@ body{{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;pad
 .wrap{{max-width:700px;margin:0 auto}}
 h1{{font-size:24px;margin-bottom:20px}}
 .card{{background:#161b22;border-radius:10px;padding:18px;margin-bottom:14px;border:1px solid #30363d}}
-.label{{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}}
+.label{{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px}}
 .value{{font-size:20px;margin-top:6px;font-weight:600}}
 .ok{{color:#3fb950}}.err{{color:#f85149}}
-.day-row{{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #21262d;font-size:15px}}
-.day-row:last-child{{border-bottom:none}}
-.day-label{{color:#8b949e}}.day-count{{font-weight:600;color:#e6edf3}}
+.cal-title{{font-size:15px;font-weight:600;margin-bottom:10px;color:#e6edf3}}
+.cal{{width:100%;border-collapse:collapse;font-size:13px}}
+.cal th{{color:#8b949e;font-weight:500;padding:4px 0;text-align:center}}
+.cal-empty{{}}
+.cal-day{{text-align:center;padding:6px 2px;vertical-align:top;border-radius:6px}}
+.cal-today{{background:#21262d}}
+.cal-d{{display:block;font-size:12px;color:#8b949e}}
+.cal-n{{display:block;font-size:16px;font-weight:600;color:#30363d;margin-top:2px}}
+.cal-npos{{display:block;font-size:16px;font-weight:600;color:#3fb950;margin-top:2px}}
 </style></head>
 <body><div class="wrap">
 <h1>🚗 Kijiji GTA Car Monitor</h1>
 <div class="card"><div class="label">Status</div>
 <div class="value {'ok' if status=='Running' else 'err'}">{status}</div></div>
 <div class="card"><div class="label">Last Scrape</div><div class="value">{last}</div></div>
-<div class="card"><div class="label">New Today</div><div class="value">{new_today}</div></div>
+<div class="card"><div class="label">New Today</div><div class="value ok">{new_today}</div></div>
 <div class="card">
   <div class="label">Daily Listings Pushed</div>
-  {daily_html}
+  {cal_html}
 </div>
 <div class="card"><div class="label">Last Error</div>
 <div class="value {'err' if error!='None' else 'ok'}">{error}</div></div>
