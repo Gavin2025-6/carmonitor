@@ -20,7 +20,7 @@ KIJIJI_URL = "https://www.kijiji.ca/b-cars-trucks/toronto-gta/c174l1700272"
 DB_PATH = "kijiji_seen.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID = "@TorontoCarAlert"
 SLEEP_SECONDS = 300
 
 # ---------------------------------------------------------------------------
@@ -51,14 +51,23 @@ BLOCK_KEYWORDS = ("WANTED", "REBUILT", "SALVAGE", "PARTS ONLY")
 DEALER_KEYWORDS = ("dealer", "dealership", "financing available", "omvic", "trade-in", "car lot")
 
 app = Flask(__name__)
-monitor_state = {"running": False, "last_scrape": None, "last_error": None, "new_today": 0}
+monitor_state = {"running": False, "last_scrape": None, "last_error": None}
 state_lock = threading.Lock()
+
+
+_CREATE_DAILY = """
+    CREATE TABLE IF NOT EXISTS daily_counts (
+        date TEXT PRIMARY KEY,
+        count INTEGER NOT NULL DEFAULT 0
+    )
+"""
 
 
 def init_db():
     if _use_pg():
         conn = _pg_conn()
-        conn.cursor().execute("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS seen (
                 listing_id TEXT PRIMARY KEY,
                 title TEXT,
@@ -69,6 +78,7 @@ def init_db():
                 created_at TEXT
             )
         """)
+        cur.execute(_CREATE_DAILY)
         conn.commit()
         conn.close()
         print("[db] Using PostgreSQL")
@@ -85,6 +95,7 @@ def init_db():
                 created_at TEXT
             )
         """)
+        conn.execute(_CREATE_DAILY)
         conn.commit()
         conn.close()
         print("[db] Using SQLite (local)")
@@ -126,6 +137,47 @@ def mark_seen(listing):
         )
         conn.commit()
         conn.close()
+
+
+def increment_daily_count():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _use_pg():
+        conn = _pg_conn()
+        conn.cursor().execute(
+            """INSERT INTO daily_counts (date, count) VALUES (%s, 1)
+               ON CONFLICT (date) DO UPDATE SET count = daily_counts.count + 1""",
+            (today,)
+        )
+        conn.commit()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        conn.execute(
+            "INSERT INTO daily_counts (date, count) VALUES (?, 1) "
+            "ON CONFLICT (date) DO UPDATE SET count = daily_counts.count + 1",
+            (today,)
+        )
+        conn.commit()
+        conn.close()
+
+
+def get_daily_counts(days=7):
+    """Return list of (date_str, count) for the last N days, newest first."""
+    if _use_pg():
+        conn = _pg_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT date, count FROM daily_counts ORDER BY date DESC LIMIT %s", (days,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        rows = conn.execute(
+            "SELECT date, count FROM daily_counts ORDER BY date DESC LIMIT ?", (days,)
+        ).fetchall()
+        conn.close()
+    return rows
 
 
 def parse_price(text):
@@ -541,6 +593,7 @@ def scrape_cycle():
         print(f"[cycle] new id={lid!r} age={int(age_seconds)}s title={l['title'][:40]!r}")
         mark_seen(l)
         send_telegram(l)
+        increment_daily_count()
         new += 1
     print(f"[cycle] done: {new} new")
     return new
@@ -555,7 +608,7 @@ def monitor_loop():
             with state_lock:
                 monitor_state["last_scrape"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 monitor_state["last_error"] = None
-                monitor_state["new_today"] = monitor_state.get("new_today", 0) + new
+
             print(f"[{datetime.now().isoformat(timespec='seconds')}] New listings: {new}")
         except Exception as e:
             with state_lock:
@@ -570,7 +623,23 @@ def dashboard():
         status = "Running" if monitor_state["running"] else "Stopped"
         last = monitor_state["last_scrape"] or "Never"
         error = monitor_state["last_error"] or "None"
-        new_today = monitor_state.get("new_today", 0)
+
+    try:
+        daily_rows = get_daily_counts(days=14)
+    except Exception:
+        daily_rows = []
+
+    def fmt_date(d):
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%b %d")
+        except Exception:
+            return d
+
+    daily_html = "".join(
+        f'<div class="day-row"><span class="day-label">{fmt_date(d)}</span>'
+        f'<span class="day-count">{c} listings</span></div>'
+        for d, c in daily_rows
+    ) or "<div style='color:#8b949e'>No data yet</div>"
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Car Monitor</title>
@@ -579,16 +648,22 @@ body{{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;pad
 .wrap{{max-width:700px;margin:0 auto}}
 h1{{font-size:24px;margin-bottom:20px}}
 .card{{background:#161b22;border-radius:10px;padding:18px;margin-bottom:14px;border:1px solid #30363d}}
-.label{{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em}}
+.label{{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}}
 .value{{font-size:20px;margin-top:6px;font-weight:600}}
 .ok{{color:#3fb950}}.err{{color:#f85149}}
+.day-row{{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #21262d;font-size:15px}}
+.day-row:last-child{{border-bottom:none}}
+.day-label{{color:#8b949e}}.day-count{{font-weight:600;color:#e6edf3}}
 </style></head>
 <body><div class="wrap">
 <h1>🚗 Kijiji GTA Car Monitor</h1>
 <div class="card"><div class="label">Status</div>
 <div class="value {'ok' if status=='Running' else 'err'}">{status}</div></div>
 <div class="card"><div class="label">Last Scrape</div><div class="value">{last}</div></div>
-<div class="card"><div class="label">New Today</div><div class="value">{new_today}</div></div>
+<div class="card">
+  <div class="label">Daily Listings Pushed</div>
+  {daily_html}
+</div>
 <div class="card"><div class="label">Last Error</div>
 <div class="value {'err' if error!='None' else 'ok'}">{error}</div></div>
 </div></body></html>"""
