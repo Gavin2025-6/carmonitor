@@ -199,26 +199,27 @@ def get_today_total():
 
 
 def backfill_daily_counts():
-    """Populate daily_counts from seen.created_at for any date not yet recorded."""
+    """Populate daily_counts from seen.created_at, overwriting with accurate counts."""
     if _use_pg():
         conn = _pg_conn()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO daily_counts (date, count)
-            SELECT LEFT(created_at, 10), COUNT(*)
+            SELECT DATE(created_at), COUNT(*)
             FROM seen
-            GROUP BY LEFT(created_at, 10)
-            ON CONFLICT (date) DO NOTHING
+            GROUP BY DATE(created_at)
+            ON CONFLICT (date) DO UPDATE SET count = EXCLUDED.count
         """)
         conn.commit()
         conn.close()
     else:
         conn = _sqlite_conn()
         conn.execute("""
-            INSERT OR IGNORE INTO daily_counts (date, count)
-            SELECT SUBSTR(created_at, 1, 10), COUNT(*)
+            INSERT INTO daily_counts (date, count)
+            SELECT DATE(created_at), COUNT(*)
             FROM seen
-            GROUP BY SUBSTR(created_at, 1, 10)
+            GROUP BY DATE(created_at)
+            ON CONFLICT (date) DO UPDATE SET count = EXCLUDED.count
         """)
         conn.commit()
         conn.close()
