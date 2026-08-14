@@ -1,4 +1,5 @@
 import calendar
+import html as html_module
 import os
 import json
 import random
@@ -7,7 +8,7 @@ import sqlite3
 import statistics
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -51,6 +52,30 @@ USER_AGENTS = [
 BLOCK_KEYWORDS = ("WANTED", "REBUILT", "SALVAGE", "PARTS ONLY")
 DEALER_KEYWORDS = ("dealer", "dealership", "financing available", "omvic", "trade-in", "car lot")
 
+# --- 推送分流:车行硬信号(纯文本正则,针对详情页全文/列表页摘要兜底) ---
+# 注:验证阶段用真实详情页文本测过一轮,发现车行文案的实际写法比字面示例("HST extra"/
+# "trade-ins welcome")灵活得多——常见的是"HST and licensing extra"、"All trades welcome"、
+# "On-site financing available"这类变体,原始严格正则会漏判,已放宽到能覆盖这些真实变体,
+# 信号的方向和"最强的一条"判断标准不变。
+RE_ROUTE_HST_TAX = re.compile(
+    r"\+\s*hst\b|plus\s+hst\b|plus\s+tax(es)?\b|plus\s+licens|"
+    r"hst\b.{0,25}\b(extra|licens\w*)\b", re.I
+)
+RE_ROUTE_NO_TAX = re.compile(r"\bno\s+hst\b|\bno\s+tax\b|\bprivate\s+sale\b", re.I)
+RE_ROUTE_OMVIC = re.compile(r"\bomvic\b|\budca\b|dealer\s*#|licen[cs]e\s*#", re.I)
+RE_ROUTE_STOCK_LOT = re.compile(
+    r"\bstock\s*#|\bstk\s*#|\bour\s+(lot|showroom|sales\s+team)\b|\bbusiness\s+hours\b", re.I
+)
+RE_ROUTE_FINANCING = re.compile(
+    r"we\s+finance\b|in-?house\s+financing|all\s+credit\s+approved|bad\s+credit|"
+    r"financing\s+available|on-?site\s+financing", re.I
+)
+RE_ROUTE_TRADEIN = re.compile(
+    r"trade-?ins?\s+(welcome|accepted)|trades?\s+welcome|we\s+accept\s+trade-?ins?", re.I
+)
+
+DETAIL_FETCH_DELAY_RANGE = (3, 8)  # 详情页请求之间的随机间隔(秒)
+
 app = Flask(__name__)
 monitor_state = {"running": False, "last_scrape": None, "last_error": None}
 state_lock = threading.Lock()
@@ -76,7 +101,10 @@ def init_db():
                 location TEXT,
                 posted_time TEXT,
                 link TEXT,
-                created_at TEXT
+                created_at TEXT,
+                seller_route TEXT,
+                mileage INTEGER,
+                digest_sent_at TEXT
             )
         """)
         cur.execute(_CREATE_DAILY)
@@ -93,13 +121,45 @@ def init_db():
                 location TEXT,
                 posted_time TEXT,
                 link TEXT,
-                created_at TEXT
+                created_at TEXT,
+                seller_route TEXT,
+                mileage INTEGER,
+                digest_sent_at TEXT
             )
         """)
         conn.execute(_CREATE_DAILY)
         conn.commit()
         conn.close()
         print("[db] Using SQLite (local)")
+
+    _ensure_seen_columns()
+
+
+def _ensure_seen_columns():
+    """迁移安全网:老的 seen 表(线上已存在、缺新字段)在这里补列,不影响已有数据。"""
+    columns = [("seller_route", "TEXT"), ("mileage", "INTEGER"), ("digest_sent_at", "TEXT")]
+    if _use_pg():
+        conn = _pg_conn()
+        cur = conn.cursor()
+        for name, typ in columns:
+            try:
+                cur.execute(f"ALTER TABLE seen ADD COLUMN IF NOT EXISTS {name} {typ}")
+            except Exception as e:
+                print(f"[db] add column {name} error: {e}")
+        conn.commit()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(seen)").fetchall()}
+        for name, typ in columns:
+            if name not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE seen ADD COLUMN {name} {typ}")
+                except Exception as e:
+                    print(f"[db] add column {name} error: {e}")
+        conn.commit()
+        conn.close()
+    print("[db] seen table columns ensured: seller_route, mileage, digest_sent_at")
 
 
 def is_seen(listing_id):
@@ -117,24 +177,28 @@ def is_seen(listing_id):
 
 
 def mark_seen(listing):
+    seller_route = listing.get("seller_route")
+    mileage = listing.get("mileage")
     if _use_pg():
         conn = _pg_conn()
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO seen (listing_id, title, price, location, posted_time, link, created_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """INSERT INTO seen (listing_id, title, price, location, posted_time, link, created_at, seller_route, mileage)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (listing_id) DO NOTHING""",
             (listing["listing_id"], listing["title"], listing.get("price"), listing.get("location"),
-             listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat())
+             listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat(),
+             seller_route, mileage)
         )
         conn.commit()
         conn.close()
     else:
         conn = _sqlite_conn()
         conn.execute(
-            "INSERT OR IGNORE INTO seen (listing_id, title, price, location, posted_time, link, created_at) VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO seen (listing_id, title, price, location, posted_time, link, created_at, seller_route, mileage) VALUES (?,?,?,?,?,?,?,?,?)",
             (listing["listing_id"], listing["title"], listing.get("price"), listing.get("location"),
-             listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat())
+             listing.get("posted_time"), listing["link"], datetime.utcnow().isoformat(),
+             seller_route, mileage)
         )
         conn.commit()
         conn.close()
@@ -238,6 +302,197 @@ def parse_mileage(text):
 def classify_seller(text):
     t = (text or "").lower()
     return "DEALER" if any(k in t for k in DEALER_KEYWORDS) else "PRIVATE"
+
+
+# ---------------------------------------------------------------------------
+# 推送分流:车行 vs 私人(独立于上面的 classify_seller/analyze_listing,
+# 不影响现有推送文案/HOT DEAL 逻辑,只决定这条帖子走实时推送还是进车行汇总)
+# ---------------------------------------------------------------------------
+
+def fetch_full_description(link):
+    """只为拿详情页全文描述。失败(超时/非200/解析不到)一律返回 None,
+    调用方要软着陆退回列表页的~200字符摘要,不能因此中断抓取循环。
+    """
+    try:
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        r = requests.get(link, headers=headers, timeout=20)
+        if r.status_code != 200:
+            print(f"[detail] status={r.status_code} url={link}")
+            return None
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">', r.text)
+        if not m:
+            print(f"[detail] NEXT_DATA not found url={link}")
+            return None
+        start = m.end()
+        end = r.text.find("</script>", start)
+        if end == -1:
+            print(f"[detail] NEXT_DATA not closed url={link}")
+            return None
+        next_data = json.loads(r.text[start:end])
+        apollo = next_data.get("props", {}).get("pageProps", {}).get("__APOLLO_STATE__", {})
+        listing_obj = None
+        for key, val in apollo.items():
+            if key.startswith("AutosListing:"):
+                listing_obj = val
+                break
+        if listing_obj is None:
+            print(f"[detail] AutosListing not found in APOLLO_STATE url={link}")
+            return None
+        desc_html = listing_obj.get("description") or ""
+        desc_text = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ")
+        desc_text = re.sub(r"\s+", " ", desc_text).strip()
+        return desc_text or None
+    except Exception as e:
+        print(f"[detail] error fetching {link}: {e}")
+        return None
+
+
+def classify_route(title, description_text):
+    """车行硬信号命中任一即判 dealer,其余一律 private(判不准就归私人,宁可多推)。"""
+    text = f"{title or ''} {description_text or ''}"
+
+    hst_hit = bool(RE_ROUTE_HST_TAX.search(text))
+    if hst_hit and not RE_ROUTE_NO_TAX.search(text):
+        return "dealer", "hst_tax"
+    if RE_ROUTE_OMVIC.search(text):
+        return "dealer", "omvic"
+    if RE_ROUTE_STOCK_LOT.search(text):
+        return "dealer", "stock_or_lot"
+    if RE_ROUTE_FINANCING.search(text):
+        return "dealer", "financing"
+    if RE_ROUTE_TRADEIN.search(text):
+        return "dealer", "trade_in"
+    return "private", None
+
+
+def get_undigested_dealer_rows(before_iso):
+    if _use_pg():
+        conn = _pg_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT listing_id, title, price, location, link, mileage, created_at FROM seen "
+            "WHERE seller_route='dealer' AND digest_sent_at IS NULL AND created_at < %s ORDER BY created_at",
+            (before_iso,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        rows = conn.execute(
+            "SELECT listing_id, title, price, location, link, mileage, created_at FROM seen "
+            "WHERE seller_route='dealer' AND digest_sent_at IS NULL AND created_at < ? ORDER BY created_at",
+            (before_iso,)
+        ).fetchall()
+        conn.close()
+    return rows
+
+
+def mark_digest_sent(listing_ids, sent_at_iso):
+    if not listing_ids:
+        return
+    if _use_pg():
+        conn = _pg_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE seen SET digest_sent_at=%s WHERE listing_id = ANY(%s)",
+            (sent_at_iso, listing_ids)
+        )
+        conn.commit()
+        conn.close()
+    else:
+        conn = _sqlite_conn()
+        qmarks = ",".join("?" for _ in listing_ids)
+        conn.execute(
+            f"UPDATE seen SET digest_sent_at=? WHERE listing_id IN ({qmarks})",
+            [sent_at_iso, *listing_ids]
+        )
+        conn.commit()
+        conn.close()
+
+
+def send_dealer_digest_batch(header_text, lines):
+    """发一批车行汇总消息,超4096字符自动拆条。返回是否全部发送成功。"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    wrapper_overhead = len(header_text) + len("<tg-spoiler></tg-spoiler>") + 20
+    max_body = 4096 - wrapper_overhead
+
+    chunks = []
+    current, current_len = [], 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current and current_len + line_len > max_body:
+            chunks.append(current)
+            current, current_len = [], 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append(current)
+
+    ok_all = True
+    for i, chunk in enumerate(chunks):
+        suffix = "" if len(chunks) == 1 else f" ({i + 1}/{len(chunks)})"
+        body = "\n".join(chunk)
+        text = f"{header_text}{suffix}\n\n<tg-spoiler>{body}</tg-spoiler>"
+        try:
+            resp = requests.post(f"{base}/sendMessage", json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text[:4096],
+                "parse_mode": "HTML",
+                "disable_notification": True,
+            }, timeout=20)
+            data = resp.json()
+            if not data.get("ok"):
+                print(f"[digest] send error: {data}")
+                ok_all = False
+        except Exception as e:
+            print(f"[digest] send exception: {e}")
+            ok_all = False
+    return ok_all
+
+
+def run_dealer_digest():
+    """每轮循环都会调用一次,但只在整点过后、还有未发的车行帖时才真正发送。
+    发送失败不标记 digest_sent_at,下一轮(5分钟后)会自动重试,不会丢车。
+    """
+    now = datetime.utcnow()
+    current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+    rows = get_undigested_dealer_rows(current_hour_start.isoformat())
+    if not rows:
+        return
+
+    buckets = {}
+    for row in rows:
+        listing_id, title, price, location, link, mileage, created_at = row
+        try:
+            created_dt = datetime.fromisoformat(created_at)
+        except (TypeError, ValueError):
+            created_dt = current_hour_start - timedelta(hours=1)
+        hour_start = created_dt.replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(hour_start, []).append({
+            "listing_id": listing_id, "title": title, "price": price,
+            "location": location, "link": link, "mileage": mileage,
+        })
+
+    for hour_start in sorted(buckets.keys()):
+        items = buckets[hour_start]
+        hour_end = hour_start + timedelta(hours=1)
+        header = f"🏢 车行 · {hour_start.strftime('%H:%M')}–{hour_end.strftime('%H:%M')} · {len(items)} 台"
+        lines = []
+        for it in items:
+            mileage_str = f"{it['mileage']:,}km" if it["mileage"] else "N/A"
+            price_str = f"${it['price']:,}" if it["price"] else "N/A"
+            title_esc = html_module.escape(it["title"] or "", quote=False)
+            location_esc = html_module.escape(it["location"] or "", quote=False)
+            lines.append(f"{title_esc} · {mileage_str} · {price_str} · {location_esc} · {it['link']}")
+
+        ok = send_dealer_digest_batch(html_module.escape(header, quote=False), lines)
+        if ok:
+            mark_digest_sent([it["listing_id"] for it in items], datetime.utcnow().isoformat())
+            print(f"[digest] sent {len(items)} dealer listings for {hour_start}-{hour_end}")
+        else:
+            print(f"[digest] FAILED to send for {hour_start}-{hour_end}, will retry next cycle")
 
 
 def analyze_listing(title, description, price, mileage, year, seller=None, market_price=None):
@@ -616,6 +871,8 @@ def scrape_cycle():
     listings = scrape_listings()
     print(f"[cycle] total listings after scrape: {len(listings)}")
     new = 0
+    detail_ok = 0
+    detail_fail = 0
     for l in listings:
         lid = l["listing_id"]
         if is_seen(lid):
@@ -633,10 +890,28 @@ def scrape_cycle():
             mark_seen(l)
             continue
         print(f"[cycle] new id={lid!r} age={int(age_seconds)}s title={l['title'][:40]!r}")
+
+        full_desc = fetch_full_description(l["link"])
+        if full_desc:
+            detail_ok += 1
+            desc_for_route = full_desc
+        else:
+            detail_fail += 1
+            desc_for_route = l.get("description", "")  # 软着陆:退回列表页摘要
+        time.sleep(random.uniform(*DETAIL_FETCH_DELAY_RANGE))
+
+        route, reason = classify_route(l["title"], desc_for_route)
+        l["seller_route"] = route
+        print(f"[route] id={lid!r} route={route} reason={reason} detail_ok={bool(full_desc)}")
+
         mark_seen(l)
-        send_telegram(l)
+
+        if route == "dealer":
+            print(f"[route] id={lid!r} queued for hourly dealer digest")
+        else:
+            send_telegram(l)
         new += 1
-    print(f"[cycle] done: {new} new")
+    print(f"[cycle] done: {new} new, detail_fetch ok={detail_ok} fail={detail_fail}")
     return new
 
 
@@ -651,6 +926,8 @@ def monitor_loop():
                 monitor_state["last_error"] = None
 
             print(f"[{datetime.now().isoformat(timespec='seconds')}] New listings: {new}")
+
+            run_dealer_digest()
         except Exception as e:
             with state_lock:
                 monitor_state["last_error"] = str(e)
